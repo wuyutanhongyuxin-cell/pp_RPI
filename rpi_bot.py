@@ -80,6 +80,7 @@ class RPIConfig:
 
     # 趋势过滤
     trend_filter_enabled: bool = True  # 是否启用趋势过滤
+    orderbook_imbalance_threshold: float = -0.1  # 订单簿不平衡阈值
 
     # 运行状态
     enabled: bool = True
@@ -311,6 +312,40 @@ class ParadexInteractiveClient:
             return None
         except Exception as e:
             log.error(f"获取 BBO 失败: {e}")
+            return None
+
+    async def get_orderbook_imbalance(self, market: str, depth: int = 5) -> Optional[float]:
+        """
+        获取订单簿不平衡度
+        返回值 > 0 表示买压大于卖压（看涨）
+        返回值 < 0 表示卖压大于买压（看跌）
+        """
+        try:
+            if not await self.ensure_authenticated():
+                return None
+
+            import aiohttp
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                url = f"{self.base_url}/orderbook/{market}?depth={depth}"
+                async with session.get(url, headers=self._get_auth_headers()) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        bids = data.get("bids", [])
+                        asks = data.get("asks", [])
+
+                        # 计算买卖总量
+                        total_bid_size = sum(float(b[1]) for b in bids[:depth])
+                        total_ask_size = sum(float(a[1]) for a in asks[:depth])
+
+                        if total_bid_size + total_ask_size == 0:
+                            return 0
+
+                        # 不平衡度：(买量 - 卖量) / (买量 + 卖量)
+                        imbalance = (total_bid_size - total_ask_size) / (total_bid_size + total_ask_size)
+                        return imbalance
+            return None
+        except Exception as e:
+            log.error(f"获取订单簿不平衡度失败: {e}")
             return None
 
     async def place_market_order(
@@ -711,20 +746,36 @@ class RPIBot:
         if spread_pct > self.config.max_spread_pct:
             return False, f"Spread 过大: {spread_pct:.4f}% > {self.config.max_spread_pct}%"
 
-        # 3.5 [新增] 趋势过滤 - 只在价格上涨时入场
+        # 3.5 [优化] 严格趋势过滤 - 连续上涨 + 订单簿检查
         if self.config.trend_filter_enabled:
-            # 等待一小段时间获取第二个价格点
-            await asyncio.sleep(0.5)
-            bbo2 = await self.client.get_bbo(market)
-            if bbo2:
-                price_change = bbo2["bid"] - bid
-                if price_change < 0:
-                    return False, f"趋势向下: {price_change:.2f}, 跳过"
-                elif price_change > 0:
-                    log.info(f"[趋势] 价格上涨 +${price_change:.2f}, 入场!")
-                    bid = bbo2["bid"]
-                    ask = bbo2["ask"]
-                # price_change == 0 时继续
+            # 检查订单簿不平衡度
+            imbalance = await self.client.get_orderbook_imbalance(market, depth=5)
+            if imbalance is not None:
+                if imbalance < -0.1:  # 卖压明显大于买压
+                    return False, f"订单簿看跌: 不平衡度={imbalance:.2f}"
+                log.info(f"[订单簿] 不平衡度: {imbalance:.2f} ({'买压' if imbalance > 0 else '卖压'})")
+
+            # 连续检查价格 2 次，都要上涨才入场
+            prices = [bid]
+            for i in range(2):
+                await asyncio.sleep(0.3)
+                bbo_check = await self.client.get_bbo(market)
+                if bbo_check:
+                    prices.append(bbo_check["bid"])
+
+            # 检查是否连续上涨
+            if len(prices) >= 3:
+                trend_up = prices[1] >= prices[0] and prices[2] >= prices[1]
+                total_change = prices[2] - prices[0]
+
+                if not trend_up or total_change < 0:
+                    return False, f"趋势不佳: {prices[0]:.1f} -> {prices[1]:.1f} -> {prices[2]:.1f}"
+
+                log.info(f"[趋势] 连续上涨: +${total_change:.2f}, 入场!")
+                bid = prices[2]
+                # 更新 ask
+                if bbo_check:
+                    ask = bbo_check["ask"]
 
         # 考虑杠杆 (Paradex 默认最高 50x)，只需要 2% 保证金 + 10% 缓冲
         leverage = 50
