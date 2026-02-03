@@ -720,45 +720,51 @@ class RPIBot:
         else:
             log.info(f"  -> flags={buy_flags}")
 
-        # 5. [优化] 等待价格上涨或止损
-        target_price = entry_price * (1 + self.config.min_profit_pct / 100)
-        stop_price = entry_price * (1 - self.config.stop_loss_pct / 100)
-        log.info(f"[等待] 止盈: ${target_price:.1f} (+{self.config.min_profit_pct}%) | 止损: ${stop_price:.1f} (-{self.config.stop_loss_pct}%)")
-
-        wait_start = time.time()
+        # 5. [优化] 等待价格上涨或止损 (或立即平仓)
         best_bid = bid
-        exit_reason = "timeout"
+        exit_reason = "instant"
 
-        while time.time() - wait_start < self.config.max_wait_seconds:
-            # 检查是否收到退出信号
-            if _shutdown_requested:
-                log.info("[中断] 收到退出信号，立即平仓")
-                exit_reason = "shutdown"
-                break
-
-            # 获取最新价格
-            new_bbo = await self.client.get_bbo(market)
-            if new_bbo:
-                best_bid = new_bbo["bid"]
-
-                # 检查止盈
-                if best_bid >= target_price:
-                    waited = time.time() - wait_start
-                    log.info(f"[止盈] Bid: ${best_bid:.1f} >= 目标: ${target_price:.1f} (等待 {waited:.1f}s)")
-                    exit_reason = "take_profit"
-                    break
-
-                # 检查止损
-                if best_bid <= stop_price:
-                    waited = time.time() - wait_start
-                    log.info(f"[止损] Bid: ${best_bid:.1f} <= 止损: ${stop_price:.1f} (等待 {waited:.1f}s)")
-                    exit_reason = "stop_loss"
-                    break
-
-            await asyncio.sleep(self.config.check_interval)
+        # 如果 MAX_WAIT_SECONDS <= 0，立即平仓模式
+        if self.config.max_wait_seconds <= 0:
+            log.info(f"[立即平仓] 极速模式，不等待")
         else:
-            waited = time.time() - wait_start
-            log.info(f"[超时] 等待 {waited:.1f}s，Bid: ${best_bid:.1f}，执行平仓")
+            target_price = entry_price * (1 + self.config.min_profit_pct / 100)
+            stop_price = entry_price * (1 - self.config.stop_loss_pct / 100)
+            log.info(f"[等待] 止盈: ${target_price:.1f} (+{self.config.min_profit_pct}%) | 止损: ${stop_price:.1f} (-{self.config.stop_loss_pct}%)")
+
+            wait_start = time.time()
+            exit_reason = "timeout"
+
+            while time.time() - wait_start < self.config.max_wait_seconds:
+                # 检查是否收到退出信号
+                if _shutdown_requested:
+                    log.info("[中断] 收到退出信号，立即平仓")
+                    exit_reason = "shutdown"
+                    break
+
+                # 获取最新价格
+                new_bbo = await self.client.get_bbo(market)
+                if new_bbo:
+                    best_bid = new_bbo["bid"]
+
+                    # 检查止盈
+                    if best_bid >= target_price:
+                        waited = time.time() - wait_start
+                        log.info(f"[止盈] Bid: ${best_bid:.1f} >= 目标: ${target_price:.1f} (等待 {waited:.1f}s)")
+                        exit_reason = "take_profit"
+                        break
+
+                    # 检查止损
+                    if best_bid <= stop_price:
+                        waited = time.time() - wait_start
+                        log.info(f"[止损] Bid: ${best_bid:.1f} <= 止损: ${stop_price:.1f} (等待 {waited:.1f}s)")
+                        exit_reason = "stop_loss"
+                        break
+
+                await asyncio.sleep(self.config.check_interval)
+            else:
+                waited = time.time() - wait_start
+                log.info(f"[超时] 等待 {waited:.1f}s，Bid: ${best_bid:.1f}，执行平仓")
 
         # 6. 市价卖出 (TAKER -> 再次获得 RPI)
         log.info(f"[平仓] 市价卖出 {size} BTC @ ~${best_bid:.1f}...")
