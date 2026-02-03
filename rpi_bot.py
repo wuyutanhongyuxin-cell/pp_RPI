@@ -116,6 +116,7 @@ class ParadexInteractiveClient:
         self.jwt_token: Optional[str] = None
         self.jwt_expires_at: int = 0
         self.market_info: Dict[str, Any] = {}
+        self.client_id_format = "rpi"  # 可选: rpi, timestamp, uuid, empty
 
         # 导入 paradex-py SDK
         try:
@@ -190,6 +191,22 @@ class ParadexInteractiveClient:
 
         log.info("Token 已过期或不存在，重新认证...")
         return await self.authenticate_interactive()
+
+    def _generate_client_id(self) -> str:
+        """生成 client_id，支持多种格式"""
+        import uuid
+        ts = int(time.time() * 1000)
+        
+        if self.client_id_format == "rpi":
+            return f"rpi_{ts}"
+        elif self.client_id_format == "timestamp":
+            return str(ts)
+        elif self.client_id_format == "uuid":
+            return str(uuid.uuid4())
+        elif self.client_id_format == "empty":
+            return ""
+        else:
+            return f"rpi_{ts}"
 
     def _get_auth_headers(self) -> Dict[str, str]:
         """获取带认证的请求头"""
@@ -317,7 +334,7 @@ class ParadexInteractiveClient:
                 order_type=OrderType.Market,
                 order_side=order_side,
                 size=Decimal(size),
-                client_id=f"rpi_{int(time.time()*1000)}",
+                client_id=self._generate_client_id(),
                 reduce_only=reduce_only,
                 signature_timestamp=int(time.time() * 1000),
             )
@@ -1068,6 +1085,11 @@ async def main():
     config.stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.015"))
     
     log.info(f"优化参数: spread<{config.max_spread_pct}%, 止盈>{config.min_profit_pct}%, 止损>{config.stop_loss_pct}%, 等待<{config.max_wait_seconds}s")
+
+    # 设置 client_id 格式
+    client_id_format = os.getenv("CLIENT_ID_FORMAT", "rpi")
+    client.client_id_format = client_id_format
+    log.info(f"Client ID 格式: {client_id_format}")
 
     # 创建并运行机器人
     bot = RPIBot(client, config, account_manager)
