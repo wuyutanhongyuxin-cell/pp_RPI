@@ -669,7 +669,9 @@ class RPIBot:
         if not bbo:
             return False, "无法获取市场价格"
 
-        required = float(size) * bbo["ask"] * 1.1  # 10% 缓冲
+        # 考虑杠杆 (Paradex 默认最高 50x)，只需要 2% 保证金 + 10% 缓冲
+        leverage = 50
+        required = float(size) * bbo["ask"] / leverage * 1.5  # 保证金 + 50% 安全缓冲
         if balance < required:
             return False, f"余额不足: {balance:.2f} < {required:.2f} USD"
 
