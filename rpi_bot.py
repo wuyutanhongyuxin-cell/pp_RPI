@@ -133,7 +133,7 @@ class ParadexInteractiveClient:
 
             auth_headers = self.paradex.account.auth_headers()
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 url = f"{self.base_url}/auth?token_usage=interactive"
 
                 headers = {
@@ -194,7 +194,7 @@ class ParadexInteractiveClient:
                 return None
 
             import aiohttp
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 url = f"{self.base_url}/balance"
                 async with session.get(url, headers=self._get_auth_headers()) as resp:
                     if resp.status == 200:
@@ -214,7 +214,7 @@ class ParadexInteractiveClient:
                 return []
 
             import aiohttp
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 url = f"{self.base_url}/positions"
                 async with session.get(url, headers=self._get_auth_headers()) as resp:
                     if resp.status == 200:
@@ -237,7 +237,7 @@ class ParadexInteractiveClient:
 
         try:
             import aiohttp
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 url = f"{self.base_url}/markets"
                 async with session.get(url) as resp:
                     if resp.status == 200:
@@ -257,7 +257,7 @@ class ParadexInteractiveClient:
                 return None
 
             import aiohttp
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 url = f"{self.base_url}/orderbook/{market}?depth=1"
 
                 async with session.get(url, headers=self._get_auth_headers()) as resp:
@@ -314,7 +314,7 @@ class ParadexInteractiveClient:
             order.signature = self.paradex.account.sign_order(order)
 
             import aiohttp
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 url = f"{self.base_url}/orders"
                 payload = order.dump_to_dict()
 
@@ -339,7 +339,7 @@ class ParadexInteractiveClient:
                 return 0
 
             import aiohttp
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 url = f"{self.base_url}/orders"
                 params = {"status": "OPEN"}
                 if market:
@@ -656,11 +656,15 @@ class RPIBot:
             return False, f"限速: {reason}"
 
         # 2. 检查余额
+        log.info("[检查] 获取账户余额...")
         balance = await self.client.get_balance()
         if not balance:
             return False, "无法获取余额"
 
+        log.info(f"[检查] 余额: {balance:.2f} USDC")
+
         # 获取当前价格估算所需金额
+        log.info("[检查] 获取市场价格...")
         bbo = await self.client.get_bbo(market)
         if not bbo:
             return False, "无法获取市场价格"
@@ -828,6 +832,7 @@ class RPIBot:
 
         while not _shutdown_requested:
             try:
+                log.info(f"[周期] 开始 RPI 交易周期...")
                 success, msg = await self.run_rpi_cycle()
 
                 if "all_accounts_exhausted" in msg:
@@ -844,6 +849,9 @@ class RPIBot:
                     elif result == "all_day_limited":
                         await self._wait_until_tomorrow()
                     continue
+
+                if not success:
+                    log.info(f"[周期] 失败: {msg}")
 
                 if success:
                     # 成功后等待配置的间隔
