@@ -71,8 +71,8 @@ class RPIConfig:
     max_spread_pct: float = 0.03  # 最大允许价差百分比
 
     # 止盈配置
-    min_profit_pct: float = 0.01  # 最小止盈百分比
-    max_wait_seconds: float = 30.0  # 等待止盈最长时间
+    min_profit_pct: float = 0.005  # 最小止盈百分比
+    max_wait_seconds: float = 8.0  # 等待止盈最长时间
     check_interval: float = 0.5  # 检查价格间隔
 
     # 运行状态
@@ -1039,6 +1039,14 @@ async def main():
     # 读取交易间隔配置
     trade_interval = os.getenv("TRADE_INTERVAL", "2.0").strip()
     config.trade_interval = float(trade_interval)
+
+    # 读取优化参数
+    config.max_spread_pct = float(os.getenv("MAX_SPREAD_PCT", "0.03"))
+    config.min_profit_pct = float(os.getenv("MIN_PROFIT_PCT", "0.005"))
+    config.max_wait_seconds = float(os.getenv("MAX_WAIT_SECONDS", "8.0"))
+    config.check_interval = float(os.getenv("CHECK_INTERVAL", "0.5"))
+    
+    log.info(f"优化参数: spread<{config.max_spread_pct}%, 止盈>{config.min_profit_pct}%, 等待<{config.max_wait_seconds}s")
 
     # 创建并运行机器人
     bot = RPIBot(client, config, account_manager)
