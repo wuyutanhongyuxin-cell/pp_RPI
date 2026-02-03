@@ -78,6 +78,9 @@ class RPIConfig:
     max_wait_seconds: float = 8.0  # 等待止盈最长时间
     check_interval: float = 0.5  # 检查价格间隔
 
+    # 趋势过滤
+    trend_filter_enabled: bool = True  # 是否启用趋势过滤
+
     # 运行状态
     enabled: bool = True
 
@@ -708,6 +711,21 @@ class RPIBot:
         if spread_pct > self.config.max_spread_pct:
             return False, f"Spread 过大: {spread_pct:.4f}% > {self.config.max_spread_pct}%"
 
+        # 3.5 [新增] 趋势过滤 - 只在价格上涨时入场
+        if self.config.trend_filter_enabled:
+            # 等待一小段时间获取第二个价格点
+            await asyncio.sleep(0.5)
+            bbo2 = await self.client.get_bbo(market)
+            if bbo2:
+                price_change = bbo2["bid"] - bid
+                if price_change < 0:
+                    return False, f"趋势向下: {price_change:.2f}, 跳过"
+                elif price_change > 0:
+                    log.info(f"[趋势] 价格上涨 +${price_change:.2f}, 入场!")
+                    bid = bbo2["bid"]
+                    ask = bbo2["ask"]
+                # price_change == 0 时继续
+
         # 考虑杠杆 (Paradex 默认最高 50x)，只需要 2% 保证金 + 10% 缓冲
         leverage = 50
         required = float(size) * bbo["ask"] / leverage * 1.5  # 保证金 + 50% 安全缓冲
@@ -1090,6 +1108,10 @@ async def main():
     client_id_format = os.getenv("CLIENT_ID_FORMAT", "rpi")
     client.client_id_format = client_id_format
     log.info(f"Client ID 格式: {client_id_format}")
+
+    # 趋势过滤
+    config.trend_filter_enabled = os.getenv("TREND_FILTER", "true").lower() == "true"
+    log.info(f"趋势过滤: {'开启' if config.trend_filter_enabled else '关闭'}")
 
     # 创建并运行机器人
     bot = RPIBot(client, config, account_manager)
