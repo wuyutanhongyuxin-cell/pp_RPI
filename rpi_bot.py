@@ -80,7 +80,19 @@ class RPIConfig:
 
     # 趋势过滤
     trend_filter_enabled: bool = True  # 是否启用趋势过滤
-    orderbook_imbalance_threshold: float = -0.1  # 订单簿不平衡阈值
+    orderbook_imbalance_threshold: float = 0.0  # 订单簿不平衡阈值 (>0 要求买压大于卖压)
+
+    # 波动率过滤
+    volatility_filter_enabled: bool = True  # 是否启用波动率过滤
+    max_volatility_pct: float = 0.1  # 最大允许波动率 (过去N秒价格变化%)
+    volatility_window: int = 10  # 波动率检测窗口 (秒)
+
+    # 入场模式
+    entry_mode: str = "trend"  # trend=趋势跟随, mean_reversion=均值回归, hybrid=混合
+
+    # 动态止损
+    dynamic_stop_loss: bool = True  # 是否使用动态止损 (基于spread)
+    stop_loss_spread_multiplier: float = 2.0  # 止损 = spread * 此倍数
 
     # 运行状态
     enabled: bool = True
@@ -346,6 +358,52 @@ class ParadexInteractiveClient:
             return None
         except Exception as e:
             log.error(f"获取订单簿不平衡度失败: {e}")
+            return None
+
+    async def get_price_volatility(self, market: str, window_seconds: int = 10, samples: int = 5) -> Optional[Dict]:
+        """
+        获取价格波动率
+        返回: {"volatility_pct": 波动率百分比, "trend": 趋势方向, "prices": 价格列表}
+        """
+        try:
+            prices = []
+            interval = window_seconds / samples
+
+            for i in range(samples):
+                bbo = await self.get_bbo(market)
+                if bbo:
+                    prices.append(bbo["bid"])
+                if i < samples - 1:
+                    await asyncio.sleep(interval)
+
+            if len(prices) < 2:
+                return None
+
+            # 计算波动率 (最高价 - 最低价) / 平均价
+            min_price = min(prices)
+            max_price = max(prices)
+            avg_price = sum(prices) / len(prices)
+            volatility_pct = (max_price - min_price) / avg_price * 100
+
+            # 计算趋势方向
+            price_change = prices[-1] - prices[0]
+            if price_change > 0:
+                trend = "up"
+            elif price_change < 0:
+                trend = "down"
+            else:
+                trend = "flat"
+
+            return {
+                "volatility_pct": volatility_pct,
+                "trend": trend,
+                "price_change": price_change,
+                "price_change_pct": (price_change / prices[0]) * 100 if prices[0] > 0 else 0,
+                "prices": prices,
+                "latest_price": prices[-1]
+            }
+        except Exception as e:
+            log.error(f"获取波动率失败: {e}")
             return None
 
     async def place_market_order(
@@ -709,11 +767,12 @@ class RPIBot:
 
     async def run_rpi_cycle(self) -> tuple[bool, str]:
         """
-        执行一个 RPI 交易周期 (优化版):
-        1. 检查 Spread 是否在允许范围内
-        2. 市价买入 (TAKER -> RPI)
-        3. 等待价格上涨或超时
-        4. 市价卖出 (TAKER -> RPI)
+        执行一个 RPI 交易周期 (深度优化版):
+        1. 波动率检测 - 高波动时跳过
+        2. 订单簿分析 - 要求买压 > 卖压
+        3. 入场模式选择 - 趋势/均值回归/混合
+        4. 动态止损 - 基于spread计算
+        5. 市价买卖 (TAKER -> RPI)
         """
         market = self.config.market
         size = self.config.trade_size
@@ -728,62 +787,126 @@ class RPIBot:
         balance = await self.client.get_balance()
         if not balance:
             return False, "无法获取余额"
-
         log.info(f"[检查] 余额: {balance:.2f} USDC")
 
-        # 获取当前价格估算所需金额
+        # 3. 获取市场价格和Spread
         log.info("[检查] 获取市场价格...")
         bbo = await self.client.get_bbo(market)
         if not bbo:
             return False, "无法获取市场价格"
 
-        # 3. [优化] 检查 Spread 是否在允许范围内
         bid = bbo["bid"]
         ask = bbo["ask"]
-        spread_pct = (ask - bid) / bid * 100
-        log.info(f"[检查] Spread: {spread_pct:.4f}% (限制: {self.config.max_spread_pct}%)")
+        spread = ask - bid
+        spread_pct = spread / bid * 100
+        log.info(f"[检查] Spread: ${spread:.2f} ({spread_pct:.4f}%) | 限制: {self.config.max_spread_pct}%")
 
         if spread_pct > self.config.max_spread_pct:
-            return False, f"Spread 过大: {spread_pct:.4f}% > {self.config.max_spread_pct}%"
+            return False, f"Spread 过大: {spread_pct:.4f}%"
 
-        # 3.5 [优化] 严格趋势过滤 - 连续上涨 + 订单簿检查
-        if self.config.trend_filter_enabled:
-            # 检查订单簿不平衡度
-            imbalance = await self.client.get_orderbook_imbalance(market, depth=5)
-            if imbalance is not None:
-                if imbalance < -0.1:  # 卖压明显大于买压
-                    return False, f"订单簿看跌: 不平衡度={imbalance:.2f}"
-                log.info(f"[订单簿] 不平衡度: {imbalance:.2f} ({'买压' if imbalance > 0 else '卖压'})")
+        # 4. [新增] 波动率检测
+        if self.config.volatility_filter_enabled:
+            log.info(f"[波动率] 检测中 ({self.config.volatility_window}s)...")
+            vol_data = await self.client.get_price_volatility(
+                market,
+                window_seconds=self.config.volatility_window,
+                samples=5
+            )
+            if vol_data:
+                volatility = vol_data["volatility_pct"]
+                trend = vol_data["trend"]
+                price_change_pct = vol_data["price_change_pct"]
 
-            # 连续检查价格 2 次，都要上涨才入场
+                log.info(f"[波动率] {volatility:.4f}% | 趋势: {trend} | 变化: {price_change_pct:+.4f}%")
+
+                # 波动率过高，跳过 (市场不稳定)
+                if volatility > self.config.max_volatility_pct:
+                    return False, f"波动率过高: {volatility:.4f}% > {self.config.max_volatility_pct}%"
+
+                # 更新最新价格
+                bid = vol_data["latest_price"]
+                new_bbo = await self.client.get_bbo(market)
+                if new_bbo:
+                    ask = new_bbo["ask"]
+
+        # 5. [优化] 订单簿分析 - 更严格的要求
+        imbalance = await self.client.get_orderbook_imbalance(market, depth=5)
+        if imbalance is not None:
+            threshold = self.config.orderbook_imbalance_threshold
+            log.info(f"[订单簿] 不平衡度: {imbalance:.2f} | 阈值: {threshold}")
+
+            if imbalance < threshold:
+                return False, f"订单簿不利: {imbalance:.2f} < {threshold}"
+
+        # 6. [新增] 入场模式判断
+        entry_signal = False
+        entry_reason = ""
+
+        if self.config.entry_mode == "trend" or self.config.entry_mode == "hybrid":
+            # 趋势跟随：连续上涨才入场
+            if self.config.trend_filter_enabled:
+                prices = [bid]
+                for i in range(2):
+                    await asyncio.sleep(0.2)
+                    bbo_check = await self.client.get_bbo(market)
+                    if bbo_check:
+                        prices.append(bbo_check["bid"])
+
+                if len(prices) >= 3:
+                    trend_up = prices[1] >= prices[0] and prices[2] >= prices[1]
+                    total_change = prices[2] - prices[0]
+
+                    if trend_up and total_change >= 0:
+                        entry_signal = True
+                        entry_reason = f"趋势上涨: +${total_change:.2f}"
+                        bid = prices[2]
+                        if bbo_check:
+                            ask = bbo_check["ask"]
+            else:
+                entry_signal = True
+                entry_reason = "趋势过滤关闭"
+
+        if self.config.entry_mode == "mean_reversion" or (self.config.entry_mode == "hybrid" and not entry_signal):
+            # 均值回归：价格下跌后入场 (期待反弹)
             prices = [bid]
             for i in range(2):
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
                 bbo_check = await self.client.get_bbo(market)
                 if bbo_check:
                     prices.append(bbo_check["bid"])
 
-            # 检查是否连续上涨
             if len(prices) >= 3:
-                trend_up = prices[1] >= prices[0] and prices[2] >= prices[1]
-                total_change = prices[2] - prices[0]
+                # 价格下跌但订单簿买压大 = 可能反弹
+                price_dropped = prices[2] < prices[0]
+                if price_dropped and imbalance is not None and imbalance > 0.1:
+                    entry_signal = True
+                    entry_reason = f"均值回归: 跌${prices[0]-prices[2]:.2f}, 买压={imbalance:.2f}"
+                    bid = prices[2]
+                    if bbo_check:
+                        ask = bbo_check["ask"]
 
-                if not trend_up or total_change < 0:
-                    return False, f"趋势不佳: {prices[0]:.1f} -> {prices[1]:.1f} -> {prices[2]:.1f}"
+        if not entry_signal:
+            return False, f"无入场信号 (模式: {self.config.entry_mode})"
 
-                log.info(f"[趋势] 连续上涨: +${total_change:.2f}, 入场!")
-                bid = prices[2]
-                # 更新 ask
-                if bbo_check:
-                    ask = bbo_check["ask"]
+        log.info(f"[入场] {entry_reason}")
 
-        # 考虑杠杆 (Paradex 默认最高 50x)，只需要 2% 保证金 + 10% 缓冲
+        # 7. 检查余额
         leverage = 50
-        required = float(size) * bbo["ask"] / leverage * 1.5  # 保证金 + 50% 安全缓冲
+        required = float(size) * ask / leverage * 1.5
         if balance < required:
             return False, f"余额不足: {balance:.2f} < {required:.2f} USD"
 
-        # 4. 市价买入 (TAKER -> 获得 RPI)
+        # 8. [新增] 计算动态止损
+        if self.config.dynamic_stop_loss:
+            # 动态止损 = spread * 倍数
+            dynamic_stop_pct = spread_pct * self.config.stop_loss_spread_multiplier
+            # 设置下限和上限
+            stop_loss_pct = max(0.01, min(dynamic_stop_pct, 0.05))
+            log.info(f"[动态止损] {stop_loss_pct:.3f}% (spread {spread_pct:.4f}% x {self.config.stop_loss_spread_multiplier})")
+        else:
+            stop_loss_pct = self.config.stop_loss_pct
+
+        # 9. 市价买入 (TAKER -> 获得 RPI)
         log.info(f"[开仓] 市价买入 {size} BTC @ ~${ask:.1f}...")
         buy_result = await self.client.place_market_order(
             market=market,
@@ -796,63 +919,54 @@ class RPIBot:
             return False, "买入失败"
 
         self._record_trade()
-        entry_price = ask  # 记录入场价格
+        entry_price = ask
 
-        # 检查是否获得 RPI
+        # 检查 RPI
         buy_flags = buy_result.get("flags", [])
         if "rpi" in [f.lower() for f in buy_flags]:
             self.rpi_trades += 1
-            log.info(f"  -> RPI 获得! flags={buy_flags}")
+            log.info(f"  -> RPI! flags={buy_flags}")
         else:
             log.info(f"  -> flags={buy_flags}")
 
-        # 5. [优化] 等待价格上涨或止损 (或立即平仓)
+        # 10. 等待出场
         best_bid = bid
         exit_reason = "instant"
 
-        # 如果 MAX_WAIT_SECONDS <= 0，立即平仓模式
         if self.config.max_wait_seconds <= 0:
-            log.info(f"[立即平仓] 极速模式，不等待")
+            log.info(f"[极速] 立即平仓模式")
         else:
             target_price = entry_price * (1 + self.config.min_profit_pct / 100)
-            stop_price = entry_price * (1 - self.config.stop_loss_pct / 100)
-            log.info(f"[等待] 止盈: ${target_price:.1f} (+{self.config.min_profit_pct}%) | 止损: ${stop_price:.1f} (-{self.config.stop_loss_pct}%)")
+            stop_price = entry_price * (1 - stop_loss_pct / 100)
+            log.info(f"[等待] 止盈: ${target_price:.1f} | 止损: ${stop_price:.1f}")
 
             wait_start = time.time()
             exit_reason = "timeout"
 
             while time.time() - wait_start < self.config.max_wait_seconds:
-                # 检查是否收到退出信号
                 if _shutdown_requested:
-                    log.info("[中断] 收到退出信号，立即平仓")
                     exit_reason = "shutdown"
                     break
 
-                # 获取最新价格
                 new_bbo = await self.client.get_bbo(market)
                 if new_bbo:
                     best_bid = new_bbo["bid"]
 
-                    # 检查止盈
                     if best_bid >= target_price:
-                        waited = time.time() - wait_start
-                        log.info(f"[止盈] Bid: ${best_bid:.1f} >= 目标: ${target_price:.1f} (等待 {waited:.1f}s)")
+                        log.info(f"[止盈] ${best_bid:.1f} >= ${target_price:.1f}")
                         exit_reason = "take_profit"
                         break
 
-                    # 检查止损
                     if best_bid <= stop_price:
-                        waited = time.time() - wait_start
-                        log.info(f"[止损] Bid: ${best_bid:.1f} <= 止损: ${stop_price:.1f} (等待 {waited:.1f}s)")
+                        log.info(f"[止损] ${best_bid:.1f} <= ${stop_price:.1f}")
                         exit_reason = "stop_loss"
                         break
 
                 await asyncio.sleep(self.config.check_interval)
             else:
-                waited = time.time() - wait_start
-                log.info(f"[超时] 等待 {waited:.1f}s，Bid: ${best_bid:.1f}，执行平仓")
+                log.info(f"[超时] {self.config.max_wait_seconds}s, Bid: ${best_bid:.1f}")
 
-        # 6. 市价卖出 (TAKER -> 再次获得 RPI)
+        # 11. 市价卖出
         log.info(f"[平仓] 市价卖出 {size} BTC @ ~${best_bid:.1f}...")
         sell_result = await self.client.place_market_order(
             market=market,
@@ -862,12 +976,9 @@ class RPIBot:
         )
 
         if not sell_result:
-            # 尝试获取实际仓位再平
             positions = await self.client.get_positions(market)
             if positions:
-                pos = positions[0]
-                actual_size = pos.get("size", size)
-                log.info(f"  重试平仓，实际仓位: {actual_size}")
+                actual_size = positions[0].get("size", size)
                 sell_result = await self.client.place_market_order(
                     market=market,
                     side="SELL",
@@ -877,26 +988,21 @@ class RPIBot:
 
         if sell_result:
             self._record_trade()
-
-            # 检查是否获得 RPI
             sell_flags = sell_result.get("flags", [])
             if "rpi" in [f.lower() for f in sell_flags]:
                 self.rpi_trades += 1
-                log.info(f"  -> RPI 获得! flags={sell_flags}")
-            else:
-                log.info(f"  -> flags={sell_flags}")
+                log.info(f"  -> RPI! flags={sell_flags}")
 
-            # 计算本次收益
             pnl = (best_bid - entry_price) * float(size)
-            log.info(f"  -> 预估 PnL: ${pnl:.4f}")
+            pnl_pct = (best_bid - entry_price) / entry_price * 100
+            log.info(f"  -> PnL: ${pnl:.4f} ({pnl_pct:+.4f}%) | 出场: {exit_reason}")
         else:
-            log.warning("  -> 平仓失败，稍后重试")
+            log.warning("  -> 平仓失败")
 
-        # 统计
         rpi_rate = (self.rpi_trades / self.total_trades * 100) if self.total_trades > 0 else 0
-        log.info(f"[统计] 总交易: {self.total_trades}, RPI: {self.rpi_trades} ({rpi_rate:.1f}%)")
+        log.info(f"[统计] 交易: {self.total_trades} | RPI: {self.rpi_trades} ({rpi_rate:.1f}%)")
 
-        return True, "RPI 周期完成"
+        return True, f"周期完成 ({exit_reason})"
 
 
     async def _cleanup_on_exit(self):
@@ -1163,6 +1269,25 @@ async def main():
     # 趋势过滤
     config.trend_filter_enabled = os.getenv("TREND_FILTER", "true").lower() == "true"
     log.info(f"趋势过滤: {'开启' if config.trend_filter_enabled else '关闭'}")
+
+    # 波动率过滤
+    config.volatility_filter_enabled = os.getenv("VOLATILITY_FILTER", "true").lower() == "true"
+    config.max_volatility_pct = float(os.getenv("MAX_VOLATILITY_PCT", "0.1"))
+    config.volatility_window = int(os.getenv("VOLATILITY_WINDOW", "10"))
+    log.info(f"波动率过滤: {'开启' if config.volatility_filter_enabled else '关闭'} (最大: {config.max_volatility_pct}%, 窗口: {config.volatility_window}s)")
+
+    # 订单簿阈值
+    config.orderbook_imbalance_threshold = float(os.getenv("ORDERBOOK_THRESHOLD", "0.0"))
+    log.info(f"订单簿阈值: {config.orderbook_imbalance_threshold}")
+
+    # 入场模式
+    config.entry_mode = os.getenv("ENTRY_MODE", "trend")  # trend, mean_reversion, hybrid
+    log.info(f"入场模式: {config.entry_mode}")
+
+    # 动态止损
+    config.dynamic_stop_loss = os.getenv("DYNAMIC_STOP_LOSS", "true").lower() == "true"
+    config.stop_loss_spread_multiplier = float(os.getenv("STOP_LOSS_MULTIPLIER", "2.0"))
+    log.info(f"动态止损: {'开启' if config.dynamic_stop_loss else '关闭'} (倍数: {config.stop_loss_spread_multiplier}x)")
 
     # 创建并运行机器人
     bot = RPIBot(client, config, account_manager)
