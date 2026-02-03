@@ -70,6 +70,9 @@ class RPIConfig:
     # Spread 优化配置
     max_spread_pct: float = 0.03  # 最大允许价差百分比
 
+    # 止盈止损配置
+    stop_loss_pct: float = 0.015  # 止损百分比 (价格下跌此比例则立即平仓)
+
     # 止盈配置
     min_profit_pct: float = 0.005  # 最小止盈百分比
     max_wait_seconds: float = 8.0  # 等待止盈最长时间
@@ -717,17 +720,20 @@ class RPIBot:
         else:
             log.info(f"  -> flags={buy_flags}")
 
-        # 5. [优化] 等待价格上涨或超时
+        # 5. [优化] 等待价格上涨或止损
         target_price = entry_price * (1 + self.config.min_profit_pct / 100)
-        log.info(f"[等待] 目标价格: ${target_price:.1f} (入场: ${entry_price:.1f}, +{self.config.min_profit_pct}%)")
+        stop_price = entry_price * (1 - self.config.stop_loss_pct / 100)
+        log.info(f"[等待] 止盈: ${target_price:.1f} (+{self.config.min_profit_pct}%) | 止损: ${stop_price:.1f} (-{self.config.stop_loss_pct}%)")
 
         wait_start = time.time()
         best_bid = bid
+        exit_reason = "timeout"
 
         while time.time() - wait_start < self.config.max_wait_seconds:
             # 检查是否收到退出信号
             if _shutdown_requested:
                 log.info("[中断] 收到退出信号，立即平仓")
+                exit_reason = "shutdown"
                 break
 
             # 获取最新价格
@@ -735,16 +741,24 @@ class RPIBot:
             if new_bbo:
                 best_bid = new_bbo["bid"]
 
-                # 检查是否达到目标
+                # 检查止盈
                 if best_bid >= target_price:
                     waited = time.time() - wait_start
-                    log.info(f"[达标] 当前 Bid: ${best_bid:.1f} >= 目标: ${target_price:.1f} (等待了 {waited:.1f}s)")
+                    log.info(f"[止盈] Bid: ${best_bid:.1f} >= 目标: ${target_price:.1f} (等待 {waited:.1f}s)")
+                    exit_reason = "take_profit"
+                    break
+
+                # 检查止损
+                if best_bid <= stop_price:
+                    waited = time.time() - wait_start
+                    log.info(f"[止损] Bid: ${best_bid:.1f} <= 止损: ${stop_price:.1f} (等待 {waited:.1f}s)")
+                    exit_reason = "stop_loss"
                     break
 
             await asyncio.sleep(self.config.check_interval)
         else:
             waited = time.time() - wait_start
-            log.info(f"[超时] 等待 {waited:.1f}s 未达标，当前 Bid: ${best_bid:.1f}，执行平仓")
+            log.info(f"[超时] 等待 {waited:.1f}s，Bid: ${best_bid:.1f}，执行平仓")
 
         # 6. 市价卖出 (TAKER -> 再次获得 RPI)
         log.info(f"[平仓] 市价卖出 {size} BTC @ ~${best_bid:.1f}...")
@@ -1045,8 +1059,9 @@ async def main():
     config.min_profit_pct = float(os.getenv("MIN_PROFIT_PCT", "0.005"))
     config.max_wait_seconds = float(os.getenv("MAX_WAIT_SECONDS", "8.0"))
     config.check_interval = float(os.getenv("CHECK_INTERVAL", "0.5"))
+    config.stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.015"))
     
-    log.info(f"优化参数: spread<{config.max_spread_pct}%, 止盈>{config.min_profit_pct}%, 等待<{config.max_wait_seconds}s")
+    log.info(f"优化参数: spread<{config.max_spread_pct}%, 止盈>{config.min_profit_pct}%, 止损>{config.stop_loss_pct}%, 等待<{config.max_wait_seconds}s")
 
     # 创建并运行机器人
     bot = RPIBot(client, config, account_manager)
