@@ -56,7 +56,7 @@ class RPIConfig:
 
     # 交易间隔 (秒)
     # 设置适当间隔避免频繁交易被限速
-    trade_interval: float = 2.0
+    trade_interval: float = 5.0
 
     # 市场
     market: str = "BTC-USD-PERP"
@@ -66,6 +66,14 @@ class RPIConfig:
     limits_per_minute: int = 30
     limits_per_hour: int = 300
     limits_per_day: int = 1000
+
+    # Spread 优化配置
+    max_spread_pct: float = 0.03  # 最大允许价差百分比
+
+    # 止盈配置
+    min_profit_pct: float = 0.01  # 最小止盈百分比
+    max_wait_seconds: float = 30.0  # 等待止盈最长时间
+    check_interval: float = 0.5  # 检查价格间隔
 
     # 运行状态
     enabled: bool = True
@@ -643,9 +651,11 @@ class RPIBot:
 
     async def run_rpi_cycle(self) -> tuple[bool, str]:
         """
-        执行一个 RPI 交易周期:
-        1. 市价买入 (TAKER -> RPI)
-        2. 市价卖出 (TAKER -> RPI)
+        执行一个 RPI 交易周期 (优化版):
+        1. 检查 Spread 是否在允许范围内
+        2. 市价买入 (TAKER -> RPI)
+        3. 等待价格上涨或超时
+        4. 市价卖出 (TAKER -> RPI)
         """
         market = self.config.market
         size = self.config.trade_size
@@ -669,14 +679,23 @@ class RPIBot:
         if not bbo:
             return False, "无法获取市场价格"
 
+        # 3. [优化] 检查 Spread 是否在允许范围内
+        bid = bbo["bid"]
+        ask = bbo["ask"]
+        spread_pct = (ask - bid) / bid * 100
+        log.info(f"[检查] Spread: {spread_pct:.4f}% (限制: {self.config.max_spread_pct}%)")
+
+        if spread_pct > self.config.max_spread_pct:
+            return False, f"Spread 过大: {spread_pct:.4f}% > {self.config.max_spread_pct}%"
+
         # 考虑杠杆 (Paradex 默认最高 50x)，只需要 2% 保证金 + 10% 缓冲
         leverage = 50
         required = float(size) * bbo["ask"] / leverage * 1.5  # 保证金 + 50% 安全缓冲
         if balance < required:
             return False, f"余额不足: {balance:.2f} < {required:.2f} USD"
 
-        # 3. 市价买入 (TAKER -> 获得 RPI)
-        log.info(f"[开仓] 市价买入 {size} BTC...")
+        # 4. 市价买入 (TAKER -> 获得 RPI)
+        log.info(f"[开仓] 市价买入 {size} BTC @ ~${ask:.1f}...")
         buy_result = await self.client.place_market_order(
             market=market,
             side="BUY",
@@ -688,6 +707,7 @@ class RPIBot:
             return False, "买入失败"
 
         self._record_trade()
+        entry_price = ask  # 记录入场价格
 
         # 检查是否获得 RPI
         buy_flags = buy_result.get("flags", [])
@@ -697,11 +717,37 @@ class RPIBot:
         else:
             log.info(f"  -> flags={buy_flags}")
 
-        # 短暂等待确保仓位更新
-        await asyncio.sleep(0.3)
+        # 5. [优化] 等待价格上涨或超时
+        target_price = entry_price * (1 + self.config.min_profit_pct / 100)
+        log.info(f"[等待] 目标价格: ${target_price:.1f} (入场: ${entry_price:.1f}, +{self.config.min_profit_pct}%)")
 
-        # 4. 市价卖出 (TAKER -> 再次获得 RPI)
-        log.info(f"[平仓] 市价卖出 {size} BTC...")
+        wait_start = time.time()
+        best_bid = bid
+
+        while time.time() - wait_start < self.config.max_wait_seconds:
+            # 检查是否收到退出信号
+            if _shutdown_requested:
+                log.info("[中断] 收到退出信号，立即平仓")
+                break
+
+            # 获取最新价格
+            new_bbo = await self.client.get_bbo(market)
+            if new_bbo:
+                best_bid = new_bbo["bid"]
+
+                # 检查是否达到目标
+                if best_bid >= target_price:
+                    waited = time.time() - wait_start
+                    log.info(f"[达标] 当前 Bid: ${best_bid:.1f} >= 目标: ${target_price:.1f} (等待了 {waited:.1f}s)")
+                    break
+
+            await asyncio.sleep(self.config.check_interval)
+        else:
+            waited = time.time() - wait_start
+            log.info(f"[超时] 等待 {waited:.1f}s 未达标，当前 Bid: ${best_bid:.1f}，执行平仓")
+
+        # 6. 市价卖出 (TAKER -> 再次获得 RPI)
+        log.info(f"[平仓] 市价卖出 {size} BTC @ ~${best_bid:.1f}...")
         sell_result = await self.client.place_market_order(
             market=market,
             side="SELL",
@@ -733,6 +779,10 @@ class RPIBot:
                 log.info(f"  -> RPI 获得! flags={sell_flags}")
             else:
                 log.info(f"  -> flags={sell_flags}")
+
+            # 计算本次收益
+            pnl = (best_bid - entry_price) * float(size)
+            log.info(f"  -> 预估 PnL: ${pnl:.4f}")
         else:
             log.warning("  -> 平仓失败，稍后重试")
 
@@ -741,6 +791,7 @@ class RPIBot:
         log.info(f"[统计] 总交易: {self.total_trades}, RPI: {self.rpi_trades} ({rpi_rate:.1f}%)")
 
         return True, "RPI 周期完成"
+
 
     async def _cleanup_on_exit(self):
         """退出时清理"""
