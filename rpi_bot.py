@@ -121,6 +121,11 @@ class RPIConfig:
     max_daily_loss_pct: float = 0.03  # 日内最大亏损 3%
     max_total_loss_pct: float = 0.10  # 总体最大亏损 10%
 
+    # 尾随止盈 (Trailing Stop)
+    trailing_stop_enabled: bool = True  # 是否启用尾随止盈
+    trailing_trigger_rr: float = 1.0  # 触发尾随的R/R倍数 (1.0 = 达到1:1时开始尾随)
+    trailing_distance_pct: float = 0.5  # 尾随距离 (占止损的百分比, 0.5 = 0.5R)
+
     # 运行状态
     enabled: bool = True
 
@@ -1075,10 +1080,22 @@ class RPIBot:
             return False, "无法获取余额"
         log.info(f"[检查] 余额: {balance:.2f} USDC")
 
-        # 4. [研究优化] 回撤控制
+        # 4. [研究优化] 回撤控制 - 触发时先平仓再暂停
         drawdown_ok, drawdown_reason = self._check_drawdown(balance)
         if not drawdown_ok:
+            log.warning(f"[回撤控制] {drawdown_reason}，平仓后暂停交易...")
+            await self.client.cancel_all_orders(market)
+            await self.client.close_all_positions(market)
             return False, f"回撤限制: {drawdown_reason}"
+
+        # 4.5 [新增] 检查并清理残留仓位
+        positions = await self.client.get_positions(market)
+        if positions:
+            pos_size = float(positions[0].get("size", 0))
+            if pos_size > 0:
+                log.warning(f"[清理] 检测到残留仓位 {pos_size}，先平仓...")
+                await self.client.close_all_positions(market)
+                await asyncio.sleep(0.5)  # 等待平仓完成
 
         # 3. 获取市场价格和Spread
         log.info("[检查] 获取市场价格...")
@@ -1206,7 +1223,7 @@ class RPIBot:
         if balance < required:
             return False, f"余额不足: {balance:.2f} < {required:.2f} USD"
 
-        # 9. [优化] 计算止盈止损 (使用风险收益比)
+        # 9. [优化] 计算止盈止损 (使用风险收益比，并补偿spread)
         if self.config.dynamic_stop_loss:
             # 动态止损 = spread * 倍数
             dynamic_stop_pct = spread_pct * self.config.stop_loss_spread_multiplier
@@ -1216,8 +1233,13 @@ class RPIBot:
             stop_loss_pct = self.config.stop_loss_pct
 
         # 使用风险收益比计算止盈
-        take_profit_pct = stop_loss_pct * self.config.risk_reward_ratio
-        log.info(f"[风险收益] 止盈={take_profit_pct:.3f}% : 止损={stop_loss_pct:.3f}% (R/R={self.config.risk_reward_ratio})")
+        # 重要: 由于我们在ask买入，检查bid止盈，需要补偿spread
+        # 实际收益 = (bid - ask) / ask = (target_bid - entry_ask) / entry_ask
+        # 要获得真实的R/R，止盈目标需要加上spread补偿
+        raw_take_profit_pct = stop_loss_pct * self.config.risk_reward_ratio
+        # 补偿spread: 止盈目标 = 基础止盈 + spread (因为买入是ask，卖出看bid)
+        take_profit_pct = raw_take_profit_pct + spread_pct
+        log.info(f"[风险收益] 止盈={take_profit_pct:.3f}% (含spread补偿{spread_pct:.3f}%) : 止损={stop_loss_pct:.3f}% (真实R/R={self.config.risk_reward_ratio})")
 
         # 9. 市价买入 (TAKER -> 获得 RPI)
         log.info(f"[开仓] 市价买入 {size} BTC @ ~${ask:.1f}...")
@@ -1242,7 +1264,7 @@ class RPIBot:
         else:
             log.info(f"  -> flags={buy_flags}")
 
-        # 11. 等待出场
+        # 11. 等待出场 (支持尾随止盈)
         best_bid = bid
         exit_reason = "instant"
 
@@ -1251,7 +1273,17 @@ class RPIBot:
         else:
             target_price = entry_price * (1 + take_profit_pct / 100)
             stop_price = entry_price * (1 - stop_loss_pct / 100)
+
+            # 尾随止盈参数
+            trailing_active = False
+            trailing_stop_price = stop_price
+            peak_price = entry_price
+            trailing_trigger_price = entry_price * (1 + stop_loss_pct * self.config.trailing_trigger_rr / 100)
+            trailing_distance = entry_price * (stop_loss_pct * self.config.trailing_distance_pct / 100)
+
             log.info(f"[等待] 止盈: ${target_price:.1f} (+{take_profit_pct:.3f}%) | 止损: ${stop_price:.1f} (-{stop_loss_pct:.3f}%)")
+            if self.config.trailing_stop_enabled:
+                log.info(f"[尾随] 触发价: ${trailing_trigger_price:.1f} (+{stop_loss_pct * self.config.trailing_trigger_rr:.3f}%)")
 
             wait_start = time.time()
             exit_reason = "timeout"
@@ -1265,11 +1297,36 @@ class RPIBot:
                 if new_bbo:
                     best_bid = new_bbo["bid"]
 
+                    # 更新最高价
+                    if best_bid > peak_price:
+                        peak_price = best_bid
+
+                        # 检查是否触发尾随
+                        if self.config.trailing_stop_enabled and not trailing_active and best_bid >= trailing_trigger_price:
+                            trailing_active = True
+                            trailing_stop_price = peak_price - trailing_distance
+                            log.info(f"[尾随激活] 峰值: ${peak_price:.1f}, 尾随止损: ${trailing_stop_price:.1f}")
+
+                        # 更新尾随止损
+                        if trailing_active:
+                            new_trailing_stop = peak_price - trailing_distance
+                            if new_trailing_stop > trailing_stop_price:
+                                trailing_stop_price = new_trailing_stop
+                                log.info(f"[尾随更新] 峰值: ${peak_price:.1f}, 尾随止损: ${trailing_stop_price:.1f}")
+
+                    # 检查止盈
                     if best_bid >= target_price:
                         log.info(f"[止盈] ${best_bid:.1f} >= ${target_price:.1f}")
                         exit_reason = "take_profit"
                         break
 
+                    # 检查尾随止损
+                    if trailing_active and best_bid <= trailing_stop_price:
+                        log.info(f"[尾随止盈] ${best_bid:.1f} <= ${trailing_stop_price:.1f} (峰值: ${peak_price:.1f})")
+                        exit_reason = "trailing_stop"
+                        break
+
+                    # 检查普通止损
                     if best_bid <= stop_price:
                         log.info(f"[止损] ${best_bid:.1f} <= ${stop_price:.1f}")
                         exit_reason = "stop_loss"
@@ -1279,9 +1336,10 @@ class RPIBot:
             else:
                 log.info(f"[超时] {self.config.max_wait_seconds}s, Bid: ${best_bid:.1f}")
 
-        # 12. 平仓
+        # 12. 平仓 (强制确保平仓成功)
         sell_result = None
         actual_exit_price = best_bid
+        max_close_retries = 5  # 最多重试5次
 
         if self.config.exit_order_type == "limit" and exit_reason != "stop_loss":
             # [研究优化] 使用 POST_ONLY 限价单平仓 (赚取点差)
@@ -1297,8 +1355,8 @@ class RPIBot:
 
             if limit_result:
                 order_id = limit_result.get("id")
-                # 等待成交 (最多5秒)
-                fill_result = await self.client.wait_order_fill(order_id, timeout_seconds=5.0)
+                # 等待成交 (最多3秒，缩短等待时间)
+                fill_result = await self.client.wait_order_fill(order_id, timeout_seconds=3.0)
                 if fill_result:
                     sell_result = fill_result
                     actual_exit_price = float(fill_result.get("avg_fill_price", best_bid))
@@ -1307,8 +1365,20 @@ class RPIBot:
                     # 限价单未成交，降级为市价单
                     log.info(f"  -> 限价单超时，切换市价单...")
 
-        # 市价单平仓 (作为后备或止损时使用)
-        if not sell_result:
+        # 市价单平仓 (作为后备或止损时使用) - 添加重试机制
+        for retry in range(max_close_retries):
+            if sell_result:
+                break
+
+            if retry > 0:
+                log.warning(f"[平仓重试] 第 {retry + 1}/{max_close_retries} 次尝试...")
+                await asyncio.sleep(0.5)  # 重试前等待
+
+            # 获取最新价格
+            new_bbo = await self.client.get_bbo(market)
+            if new_bbo:
+                best_bid = new_bbo["bid"]
+
             log.info(f"[平仓] 市价卖出 {size} BTC @ ~${best_bid:.1f}...")
             sell_result = await self.client.place_market_order(
                 market=market,
@@ -1317,10 +1387,14 @@ class RPIBot:
                 reduce_only=True
             )
 
-        if not sell_result:
+            if sell_result:
+                break
+
+            # 如果市价单失败，检查是否有残留仓位并尝试平掉
             positions = await self.client.get_positions(market)
             if positions:
                 actual_size = positions[0].get("size", size)
+                log.info(f"[平仓] 检测到残留仓位 {actual_size}，尝试平仓...")
                 sell_result = await self.client.place_market_order(
                     market=market,
                     side="SELL",
@@ -1328,22 +1402,43 @@ class RPIBot:
                     reduce_only=True
                 )
 
+        # 最终检查：确保没有残留仓位
+        if not sell_result:
+            log.error(f"[严重] 平仓失败 {max_close_retries} 次，执行强制平仓...")
+            await self.client.close_all_positions(market)
+            # 再次检查
+            positions = await self.client.get_positions(market)
+            if positions and float(positions[0].get("size", 0)) > 0:
+                log.error(f"[严重] 仍有残留仓位: {positions[0].get('size')}")
+            else:
+                log.info(f"[恢复] 强制平仓成功")
+                sell_result = {"forced": True}
+
         if sell_result:
             self._record_trade()
-            sell_flags = sell_result.get("flags", [])
-            if "rpi" in [f.lower() for f in sell_flags]:
-                self.rpi_trades += 1
-                log.info(f"  -> RPI! flags={sell_flags}")
 
-            pnl = (actual_exit_price - entry_price) * float(size)
-            pnl_pct = (actual_exit_price - entry_price) / entry_price * 100
+            # 检查是否是强制平仓
+            if sell_result.get("forced"):
+                log.warning("  -> 强制平仓完成，PnL 可能有误差")
+                # 估算PnL
+                pnl = (best_bid - entry_price) * float(size)
+                pnl_pct = (best_bid - entry_price) / entry_price * 100
+            else:
+                sell_flags = sell_result.get("flags", [])
+                if "rpi" in [f.lower() for f in sell_flags]:
+                    self.rpi_trades += 1
+                    log.info(f"  -> RPI! flags={sell_flags}")
+
+                pnl = (actual_exit_price - entry_price) * float(size)
+                pnl_pct = (actual_exit_price - entry_price) / entry_price * 100
+
             is_win = pnl > 0
             log.info(f"  -> PnL: ${pnl:.4f} ({pnl_pct:+.4f}%) | 出场: {exit_reason}")
 
             # [研究优化] 记录交易结果用于Kelly计算
             self._record_trade_result(pnl, is_win)
         else:
-            log.warning("  -> 平仓失败")
+            log.error("  -> [严重] 平仓完全失败，请检查仓位!")
 
         rpi_rate = (self.rpi_trades / self.total_trades * 100) if self.total_trades > 0 else 0
         win_rate = sum(1 for t in self.recent_trades if t["win"]) / len(self.recent_trades) * 100 if self.recent_trades else 0
@@ -1353,9 +1448,10 @@ class RPIBot:
 
 
     async def _cleanup_on_exit(self):
-        """退出时清理"""
+        """退出时清理 - 确保所有仓位都被平掉"""
         log.info("=" * 50)
         log.info("执行退出清理...")
+        max_cleanup_retries = 3
 
         if self.account_manager:
             for idx, client in self.account_manager.clients.items():
@@ -1365,13 +1461,35 @@ class RPIBot:
                 try:
                     if await client.ensure_authenticated():
                         await client.cancel_all_orders(self.config.market)
-                        await client.close_all_positions(self.config.market)
+
+                        # 多次尝试平仓确保成功
+                        for retry in range(max_cleanup_retries):
+                            await client.close_all_positions(self.config.market)
+                            await asyncio.sleep(0.5)
+
+                            positions = await client.get_positions(self.config.market)
+                            if not positions or float(positions[0].get("size", 0)) == 0:
+                                log.info(f"[{account_name}] 仓位已清空")
+                                break
+                            else:
+                                log.warning(f"[{account_name}] 仍有仓位，重试 {retry + 1}/{max_cleanup_retries}...")
                 except Exception as e:
                     log.error(f"[{account_name}] 清理异常: {e}")
         else:
             try:
                 await self.client.cancel_all_orders(self.config.market)
-                await self.client.close_all_positions(self.config.market)
+
+                # 多次尝试平仓确保成功
+                for retry in range(max_cleanup_retries):
+                    await self.client.close_all_positions(self.config.market)
+                    await asyncio.sleep(0.5)
+
+                    positions = await self.client.get_positions(self.config.market)
+                    if not positions or float(positions[0].get("size", 0)) == 0:
+                        log.info("仓位已清空")
+                        break
+                    else:
+                        log.warning(f"仍有仓位，重试 {retry + 1}/{max_cleanup_retries}...")
             except Exception as e:
                 log.error(f"清理异常: {e}")
 
@@ -1464,6 +1582,15 @@ class RPIBot:
 
                 if not success:
                     log.info(f"[周期] 失败: {msg}")
+
+                    # 回撤触发时等待更长时间
+                    if "回撤限制" in msg:
+                        if "日内" in msg:
+                            log.warning("[回撤] 日内回撤超限，暂停交易 30 分钟...")
+                            await asyncio.sleep(1800)  # 30分钟
+                        else:
+                            log.error("[回撤] 总回撤超限，停止交易...")
+                            break  # 完全停止
 
                 if success:
                     # 成功后等待配置的间隔
@@ -1670,6 +1797,12 @@ async def main():
     config.max_daily_loss_pct = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
     config.max_total_loss_pct = float(os.getenv("MAX_TOTAL_LOSS_PCT", "0.10"))
     log.info(f"回撤控制: {'开启' if config.drawdown_control_enabled else '关闭'} (日内: {config.max_daily_loss_pct:.0%}, 总体: {config.max_total_loss_pct:.0%})")
+
+    # 尾随止盈
+    config.trailing_stop_enabled = os.getenv("TRAILING_STOP", "true").lower() == "true"
+    config.trailing_trigger_rr = float(os.getenv("TRAILING_TRIGGER_RR", "1.0"))
+    config.trailing_distance_pct = float(os.getenv("TRAILING_DISTANCE_PCT", "0.5"))
+    log.info(f"尾随止盈: {'开启' if config.trailing_stop_enabled else '关闭'} (触发: {config.trailing_trigger_rr}R, 距离: {config.trailing_distance_pct}R)")
 
     log.info("=" * 30)
 
