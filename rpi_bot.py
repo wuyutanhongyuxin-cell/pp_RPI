@@ -1088,12 +1088,13 @@ class RPIBot:
             await self.client.close_all_positions(market)
             return False, f"回撤限制: {drawdown_reason}"
 
-        # 4.5 [新增] 检查并清理残留仓位
+        # 4.5 [新增] 检查并清理残留仓位 (支持多空双向)
         positions = await self.client.get_positions(market)
         if positions:
             pos_size = float(positions[0].get("size", 0))
-            if pos_size > 0:
-                log.warning(f"[清理] 检测到残留仓位 {pos_size}，先平仓...")
+            if pos_size != 0:  # 修复: 做空仓位是负数，需要用 != 0
+                pos_type = "多仓" if pos_size > 0 else "空仓"
+                log.warning(f"[清理] 检测到残留{pos_type} {abs(pos_size)}，先平仓...")
                 await self.client.close_all_positions(market)
                 await asyncio.sleep(0.5)  # 等待平仓完成
 
@@ -1568,11 +1569,13 @@ class RPIBot:
                             await asyncio.sleep(0.5)
 
                             positions = await client.get_positions(self.config.market)
-                            if not positions or float(positions[0].get("size", 0)) == 0:
+                            if not positions or abs(float(positions[0].get("size", 0))) == 0:
                                 log.info(f"[{account_name}] 仓位已清空")
                                 break
                             else:
-                                log.warning(f"[{account_name}] 仍有仓位，重试 {retry + 1}/{max_cleanup_retries}...")
+                                pos_size = float(positions[0].get("size", 0))
+                                pos_type = "多仓" if pos_size > 0 else "空仓"
+                                log.warning(f"[{account_name}] 仍有{pos_type} {abs(pos_size)}，重试 {retry + 1}/{max_cleanup_retries}...")
                 except Exception as e:
                     log.error(f"[{account_name}] 清理异常: {e}")
         else:
@@ -1585,11 +1588,13 @@ class RPIBot:
                     await asyncio.sleep(0.5)
 
                     positions = await self.client.get_positions(self.config.market)
-                    if not positions or float(positions[0].get("size", 0)) == 0:
+                    if not positions or abs(float(positions[0].get("size", 0))) == 0:
                         log.info("仓位已清空")
                         break
                     else:
-                        log.warning(f"仍有仓位，重试 {retry + 1}/{max_cleanup_retries}...")
+                        pos_size = float(positions[0].get("size", 0))
+                        pos_type = "多仓" if pos_size > 0 else "空仓"
+                        log.warning(f"仍有{pos_type} {abs(pos_size)}，重试 {retry + 1}/{max_cleanup_retries}...")
             except Exception as e:
                 log.error(f"清理异常: {e}")
 
