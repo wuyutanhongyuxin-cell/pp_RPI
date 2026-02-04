@@ -94,6 +94,33 @@ class RPIConfig:
     dynamic_stop_loss: bool = True  # 是否使用动态止损 (基于spread)
     stop_loss_spread_multiplier: float = 2.0  # 止损 = spread * 此倍数
 
+    # ===== 研究优化参数 =====
+
+    # 平仓模式: market=市价单(TAKER), limit=限价单(MAKER)
+    exit_order_type: str = "limit"  # 使用限价单平仓可赚取点差
+
+    # 方向信号阈值 (订单簿不平衡度)
+    direction_signal_threshold: float = 0.3  # |imbalance| > 0.3 才入场
+
+    # 风险收益比
+    risk_reward_ratio: float = 2.0  # 止盈 = 止损 * 此值
+
+    # 交易时段过滤 (UTC时间)
+    time_filter_enabled: bool = True  # 是否启用时段过滤
+    optimal_hours_start: int = 8  # 最佳时段开始 (UTC)
+    optimal_hours_end: int = 21  # 最佳时段结束 (UTC)
+    weekend_multiplier: float = 0.5  # 周末仓位倍数
+
+    # Kelly准则仓位管理
+    kelly_enabled: bool = True  # 是否启用Kelly仓位管理
+    kelly_fraction: float = 0.25  # 使用1/4 Kelly降低风险
+    max_position_pct: float = 0.20  # 最大仓位占比
+
+    # 回撤控制
+    drawdown_control_enabled: bool = True  # 是否启用回撤控制
+    max_daily_loss_pct: float = 0.03  # 日内最大亏损 3%
+    max_total_loss_pct: float = 0.10  # 总体最大亏损 10%
+
     # 运行状态
     enabled: bool = True
 
@@ -456,6 +483,113 @@ class ParadexInteractiveClient:
             log.error(f"市价单失败: {e}")
             return None
 
+    async def place_limit_order(
+        self,
+        market: str,
+        side: str,
+        size: str,
+        price: str,
+        post_only: bool = True,
+        reduce_only: bool = False,
+        time_in_force: str = "GTT",
+        ttl_seconds: int = 60
+    ) -> Optional[Dict]:
+        """
+        下限价单 (可选 POST_ONLY 模式)
+        POST_ONLY = True 时，订单只能作为 Maker，如果会立即成交则取消
+        """
+        try:
+            if not await self.ensure_authenticated():
+                return None
+
+            from paradex_py.common.order import Order, OrderSide, OrderType
+            from decimal import Decimal
+
+            order_side = OrderSide.Buy if side.upper() == "BUY" else OrderSide.Sell
+
+            # 构建指令
+            instruction = "POST_ONLY" if post_only else "GTC"
+
+            order = Order(
+                market=market,
+                order_type=OrderType.Limit,
+                order_side=order_side,
+                size=Decimal(size),
+                limit_price=Decimal(price),
+                client_id=self._generate_client_id(),
+                reduce_only=reduce_only,
+                instruction=instruction,
+                signature_timestamp=int(time.time() * 1000),
+            )
+
+            order.signature = self.paradex.account.sign_order(order)
+
+            import aiohttp
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                url = f"{self.base_url}/orders"
+                payload = order.dump_to_dict()
+
+                async with session.post(url, headers=self._get_auth_headers(), json=payload) as resp:
+                    if resp.status == 201:
+                        result = await resp.json()
+                        log.info(f"限价单成功: {side} {size} @ ${price}, order_id={result.get('id')}")
+                        return result
+                    else:
+                        error = await resp.text()
+                        log.error(f"限价单失败: {resp.status} - {error}")
+                        return None
+
+        except Exception as e:
+            log.error(f"限价单失败: {e}")
+            return None
+
+    async def wait_order_fill(self, order_id: str, timeout_seconds: float = 5.0) -> Optional[Dict]:
+        """
+        等待订单成交
+        返回: 成交信息 或 None (超时/取消)
+        """
+        try:
+            import aiohttp
+            start_time = time.time()
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds + 2)) as session:
+                while time.time() - start_time < timeout_seconds:
+                    url = f"{self.base_url}/orders/{order_id}"
+                    async with session.get(url, headers=self._get_auth_headers()) as resp:
+                        if resp.status == 200:
+                            order = await resp.json()
+                            status = order.get("status", "")
+
+                            if status == "CLOSED":
+                                # 完全成交
+                                return order
+                            elif status in ["CANCELED", "REJECTED"]:
+                                # 被取消或拒绝
+                                return None
+                            # OPEN 或 PARTIAL - 继续等待
+
+                    await asyncio.sleep(0.2)
+
+            # 超时 - 取消订单
+            await self.cancel_order(order_id)
+            return None
+
+        except Exception as e:
+            log.error(f"等待订单成交失败: {e}")
+            return None
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """取消单个订单"""
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                url = f"{self.base_url}/orders/{order_id}"
+                async with session.delete(url, headers=self._get_auth_headers()) as resp:
+                    return resp.status in [200, 204]
+        except Exception as e:
+            log.error(f"取消订单失败: {e}")
+            return False
+
     async def cancel_all_orders(self, market: str = None) -> int:
         """取消所有挂单"""
         try:
@@ -698,6 +832,13 @@ class RPIBot:
         self.rpi_trades = 0
         self.start_time = None
 
+        # 研究优化: 性能追踪
+        self.session_start_balance: Optional[float] = None
+        self.daily_start_balance: Optional[float] = None
+        self.current_day: str = ""
+        self.recent_trades: List[Dict] = []  # 最近交易记录用于Kelly计算
+        self.total_pnl: float = 0.0
+
         if self.account_manager:
             self.rate_state = self.account_manager.get_current_rate_state()
 
@@ -765,29 +906,179 @@ class RPIBot:
         if self.account_manager:
             self.account_manager.save_state()
 
+    def _record_trade_result(self, pnl: float, win: bool):
+        """记录交易结果用于Kelly计算"""
+        self.recent_trades.append({
+            "time": time.time(),
+            "pnl": pnl,
+            "win": win
+        })
+        self.total_pnl += pnl
+        # 只保留最近100笔交易
+        if len(self.recent_trades) > 100:
+            self.recent_trades = self.recent_trades[-100:]
+
+    def _check_trading_time(self) -> tuple[bool, float, str]:
+        """
+        检查当前是否为最佳交易时段
+        返回: (是否允许交易, 仓位乘数, 原因)
+        """
+        if not self.config.time_filter_enabled:
+            return True, 1.0, "时段过滤关闭"
+
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        hour = now.hour
+        weekday = now.weekday()  # 0=周一, 6=周日
+
+        # 周末检查
+        if weekday >= 5:  # 周六或周日
+            mult = self.config.weekend_multiplier
+            return True, mult, f"周末, 仓位x{mult}"
+
+        # 时段检查
+        if self.config.optimal_hours_start <= hour < self.config.optimal_hours_end:
+            # 黄金时段 (13:00-17:00 UTC 最佳)
+            if 13 <= hour < 17:
+                return True, 1.0, "黄金时段"
+            return True, 0.8, "良好时段"
+        else:
+            # 低流动性时段
+            return False, 0.3, f"低流动性时段 (UTC {hour}:00)"
+
+    def _calculate_kelly_size(self, balance: float, base_size: float) -> float:
+        """
+        使用Kelly准则计算最优仓位
+        """
+        if not self.config.kelly_enabled or len(self.recent_trades) < 10:
+            return base_size
+
+        # 统计最近交易
+        wins = [t for t in self.recent_trades if t["win"]]
+        losses = [t for t in self.recent_trades if not t["win"]]
+
+        if not wins or not losses:
+            return base_size
+
+        win_rate = len(wins) / len(self.recent_trades)
+        avg_win = sum(t["pnl"] for t in wins) / len(wins)
+        avg_loss = abs(sum(t["pnl"] for t in losses) / len(losses))
+
+        if avg_loss == 0:
+            return base_size
+
+        # Kelly公式: f* = (bp - q) / b
+        # b = avg_win / avg_loss, p = 胜率, q = 1 - p
+        b = avg_win / avg_loss
+        p = win_rate
+        q = 1 - p
+
+        kelly = (b * p - q) / b if b > 0 else 0
+
+        # 使用分数Kelly
+        adjusted_kelly = kelly * self.config.kelly_fraction
+
+        # 限制范围
+        if adjusted_kelly <= 0:
+            log.warning(f"[Kelly] 负期望值! 胜率={win_rate:.1%}, R/R={b:.2f}")
+            return base_size * 0.5  # 减半仓位
+
+        # 计算仓位
+        max_position = balance * self.config.max_position_pct
+        kelly_position = balance * min(adjusted_kelly, self.config.max_position_pct)
+
+        log.info(f"[Kelly] 胜率={win_rate:.1%}, R/R={b:.2f}, Kelly={adjusted_kelly:.2%}")
+
+        # 转换为BTC数量 (假设价格~$100,000)
+        # 这里返回一个乘数
+        return min(base_size * (1 + adjusted_kelly), base_size * 2)
+
+    def _check_drawdown(self, current_balance: float) -> tuple[bool, str]:
+        """
+        检查回撤是否超限
+        返回: (是否允许交易, 原因)
+        """
+        if not self.config.drawdown_control_enabled:
+            return True, ""
+
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # 初始化或新的一天
+        if self.current_day != today:
+            self.current_day = today
+            self.daily_start_balance = current_balance
+
+        if self.session_start_balance is None:
+            self.session_start_balance = current_balance
+            self.daily_start_balance = current_balance
+
+        # 日内回撤检查
+        if self.daily_start_balance and self.daily_start_balance > 0:
+            daily_loss = (self.daily_start_balance - current_balance) / self.daily_start_balance
+            if daily_loss >= self.config.max_daily_loss_pct:
+                return False, f"日内回撤 {daily_loss:.1%} >= {self.config.max_daily_loss_pct:.1%}"
+
+        # 总回撤检查
+        if self.session_start_balance and self.session_start_balance > 0:
+            total_loss = (self.session_start_balance - current_balance) / self.session_start_balance
+            if total_loss >= self.config.max_total_loss_pct:
+                return False, f"总回撤 {total_loss:.1%} >= {self.config.max_total_loss_pct:.1%}"
+
+        return True, ""
+
+    def _get_direction_signal(self, imbalance: Optional[float]) -> tuple[str, float]:
+        """
+        基于订单簿不平衡度获取方向信号
+        返回: (方向, 置信度)
+        """
+        if imbalance is None:
+            return "NEUTRAL", 0.0
+
+        threshold = self.config.direction_signal_threshold
+
+        if imbalance > threshold:
+            return "LONG", abs(imbalance)
+        elif imbalance < -threshold:
+            return "SHORT", abs(imbalance)
+        else:
+            return "NEUTRAL", abs(imbalance)
+
     async def run_rpi_cycle(self) -> tuple[bool, str]:
         """
-        执行一个 RPI 交易周期 (深度优化版):
-        1. 波动率检测 - 高波动时跳过
-        2. 订单簿分析 - 要求买压 > 卖压
-        3. 入场模式选择 - 趋势/均值回归/混合
-        4. 动态止损 - 基于spread计算
-        5. 市价买卖 (TAKER -> RPI)
+        执行一个 RPI 交易周期 (研究优化版):
+        1. 时段过滤 - 避开低流动性时段
+        2. 回撤控制 - 超限暂停交易
+        3. 方向信号 - 订单簿不平衡度预测
+        4. Kelly仓位 - 动态调整交易大小
+        5. 波动率检测 - 高波动时跳过
+        6. 限价单平仓 - 赚取点差而非支付
         """
         market = self.config.market
-        size = self.config.trade_size
+        base_size = self.config.trade_size
 
         # 1. 检查限速
         can_trade, reason, usage = self._can_trade()
         if not can_trade:
             return False, f"限速: {reason}"
 
-        # 2. 检查余额
+        # 2. [研究优化] 时段过滤
+        time_ok, time_mult, time_reason = self._check_trading_time()
+        if not time_ok:
+            return False, f"时段限制: {time_reason}"
+        if time_mult < 1.0:
+            log.info(f"[时段] {time_reason}")
+
+        # 3. 检查余额
         log.info("[检查] 获取账户余额...")
         balance = await self.client.get_balance()
         if not balance:
             return False, "无法获取余额"
         log.info(f"[检查] 余额: {balance:.2f} USDC")
+
+        # 4. [研究优化] 回撤控制
+        drawdown_ok, drawdown_reason = self._check_drawdown(balance)
+        if not drawdown_ok:
+            return False, f"回撤限制: {drawdown_reason}"
 
         # 3. 获取市场价格和Spread
         log.info("[检查] 获取市场价格...")
@@ -829,16 +1120,22 @@ class RPIBot:
                 if new_bbo:
                     ask = new_bbo["ask"]
 
-        # 5. [优化] 订单簿分析 - 更严格的要求
+        # 5. [研究优化] 订单簿分析 + 方向信号
         imbalance = await self.client.get_orderbook_imbalance(market, depth=5)
+        direction, confidence = self._get_direction_signal(imbalance)
+
         if imbalance is not None:
-            threshold = self.config.orderbook_imbalance_threshold
-            log.info(f"[订单簿] 不平衡度: {imbalance:.2f} | 阈值: {threshold}")
+            log.info(f"[订单簿] 不平衡度: {imbalance:.2f} | 方向: {direction} | 置信度: {confidence:.2f}")
 
-            if imbalance < threshold:
-                return False, f"订单簿不利: {imbalance:.2f} < {threshold}"
+            # 使用方向信号阈值
+            if direction == "NEUTRAL":
+                return False, f"无明确方向信号 (|{imbalance:.2f}| < {self.config.direction_signal_threshold})"
 
-        # 6. [新增] 入场模式判断
+            # 只做多 (因为我们的策略是买入后等待上涨)
+            if direction == "SHORT":
+                return False, f"卖压过大，跳过 (imbalance={imbalance:.2f})"
+
+        # 6. [简化] 入场模式判断
         entry_signal = False
         entry_reason = ""
 
@@ -858,16 +1155,16 @@ class RPIBot:
 
                     if trend_up and total_change >= 0:
                         entry_signal = True
-                        entry_reason = f"趋势上涨: +${total_change:.2f}"
+                        entry_reason = f"趋势上涨+买压: +${total_change:.2f}, imb={imbalance:.2f}"
                         bid = prices[2]
                         if bbo_check:
                             ask = bbo_check["ask"]
             else:
                 entry_signal = True
-                entry_reason = "趋势过滤关闭"
+                entry_reason = f"买压信号: imb={imbalance:.2f}"
 
         if self.config.entry_mode == "mean_reversion" or (self.config.entry_mode == "hybrid" and not entry_signal):
-            # 均值回归：价格下跌后入场 (期待反弹)
+            # 均值回归：价格下跌 + 强买压 = 可能反弹
             prices = [bid]
             for i in range(2):
                 await asyncio.sleep(0.2)
@@ -876,11 +1173,10 @@ class RPIBot:
                     prices.append(bbo_check["bid"])
 
             if len(prices) >= 3:
-                # 价格下跌但订单簿买压大 = 可能反弹
                 price_dropped = prices[2] < prices[0]
-                if price_dropped and imbalance is not None and imbalance > 0.1:
+                if price_dropped and imbalance is not None and imbalance > 0.3:
                     entry_signal = True
-                    entry_reason = f"均值回归: 跌${prices[0]-prices[2]:.2f}, 买压={imbalance:.2f}"
+                    entry_reason = f"均值回归: 跌${prices[0]-prices[2]:.2f}, 强买压={imbalance:.2f}"
                     bid = prices[2]
                     if bbo_check:
                         ask = bbo_check["ask"]
@@ -890,21 +1186,38 @@ class RPIBot:
 
         log.info(f"[入场] {entry_reason}")
 
-        # 7. 检查余额
+        # 7. [研究优化] Kelly仓位计算
+        size = base_size
+        if self.config.kelly_enabled:
+            kelly_size = self._calculate_kelly_size(balance, float(base_size))
+            size = str(round(kelly_size, 6))
+            if kelly_size != float(base_size):
+                log.info(f"[Kelly] 仓位调整: {base_size} -> {size}")
+
+        # 应用时段乘数
+        if time_mult < 1.0:
+            adjusted_size = float(size) * time_mult
+            size = str(round(adjusted_size, 6))
+            log.info(f"[时段] 仓位调整: x{time_mult} -> {size}")
+
+        # 8. 检查余额
         leverage = 50
         required = float(size) * ask / leverage * 1.5
         if balance < required:
             return False, f"余额不足: {balance:.2f} < {required:.2f} USD"
 
-        # 8. [新增] 计算动态止损
+        # 9. [优化] 计算止盈止损 (使用风险收益比)
         if self.config.dynamic_stop_loss:
             # 动态止损 = spread * 倍数
             dynamic_stop_pct = spread_pct * self.config.stop_loss_spread_multiplier
-            # 设置下限和上限
             stop_loss_pct = max(0.01, min(dynamic_stop_pct, 0.05))
             log.info(f"[动态止损] {stop_loss_pct:.3f}% (spread {spread_pct:.4f}% x {self.config.stop_loss_spread_multiplier})")
         else:
             stop_loss_pct = self.config.stop_loss_pct
+
+        # 使用风险收益比计算止盈
+        take_profit_pct = stop_loss_pct * self.config.risk_reward_ratio
+        log.info(f"[风险收益] 止盈={take_profit_pct:.3f}% : 止损={stop_loss_pct:.3f}% (R/R={self.config.risk_reward_ratio})")
 
         # 9. 市价买入 (TAKER -> 获得 RPI)
         log.info(f"[开仓] 市价买入 {size} BTC @ ~${ask:.1f}...")
@@ -929,16 +1242,16 @@ class RPIBot:
         else:
             log.info(f"  -> flags={buy_flags}")
 
-        # 10. 等待出场
+        # 11. 等待出场
         best_bid = bid
         exit_reason = "instant"
 
         if self.config.max_wait_seconds <= 0:
             log.info(f"[极速] 立即平仓模式")
         else:
-            target_price = entry_price * (1 + self.config.min_profit_pct / 100)
+            target_price = entry_price * (1 + take_profit_pct / 100)
             stop_price = entry_price * (1 - stop_loss_pct / 100)
-            log.info(f"[等待] 止盈: ${target_price:.1f} | 止损: ${stop_price:.1f}")
+            log.info(f"[等待] 止盈: ${target_price:.1f} (+{take_profit_pct:.3f}%) | 止损: ${stop_price:.1f} (-{stop_loss_pct:.3f}%)")
 
             wait_start = time.time()
             exit_reason = "timeout"
@@ -966,14 +1279,43 @@ class RPIBot:
             else:
                 log.info(f"[超时] {self.config.max_wait_seconds}s, Bid: ${best_bid:.1f}")
 
-        # 11. 市价卖出
-        log.info(f"[平仓] 市价卖出 {size} BTC @ ~${best_bid:.1f}...")
-        sell_result = await self.client.place_market_order(
-            market=market,
-            side="SELL",
-            size=size,
-            reduce_only=True
-        )
+        # 12. 平仓
+        sell_result = None
+        actual_exit_price = best_bid
+
+        if self.config.exit_order_type == "limit" and exit_reason != "stop_loss":
+            # [研究优化] 使用 POST_ONLY 限价单平仓 (赚取点差)
+            log.info(f"[平仓] 限价单卖出 {size} BTC @ ${best_bid:.1f} (POST_ONLY)...")
+            limit_result = await self.client.place_limit_order(
+                market=market,
+                side="SELL",
+                size=size,
+                price=str(round(best_bid, 1)),
+                post_only=True,
+                reduce_only=True
+            )
+
+            if limit_result:
+                order_id = limit_result.get("id")
+                # 等待成交 (最多5秒)
+                fill_result = await self.client.wait_order_fill(order_id, timeout_seconds=5.0)
+                if fill_result:
+                    sell_result = fill_result
+                    actual_exit_price = float(fill_result.get("avg_fill_price", best_bid))
+                    log.info(f"  -> 限价单成交 @ ${actual_exit_price:.1f}")
+                else:
+                    # 限价单未成交，降级为市价单
+                    log.info(f"  -> 限价单超时，切换市价单...")
+
+        # 市价单平仓 (作为后备或止损时使用)
+        if not sell_result:
+            log.info(f"[平仓] 市价卖出 {size} BTC @ ~${best_bid:.1f}...")
+            sell_result = await self.client.place_market_order(
+                market=market,
+                side="SELL",
+                size=size,
+                reduce_only=True
+            )
 
         if not sell_result:
             positions = await self.client.get_positions(market)
@@ -993,14 +1335,19 @@ class RPIBot:
                 self.rpi_trades += 1
                 log.info(f"  -> RPI! flags={sell_flags}")
 
-            pnl = (best_bid - entry_price) * float(size)
-            pnl_pct = (best_bid - entry_price) / entry_price * 100
+            pnl = (actual_exit_price - entry_price) * float(size)
+            pnl_pct = (actual_exit_price - entry_price) / entry_price * 100
+            is_win = pnl > 0
             log.info(f"  -> PnL: ${pnl:.4f} ({pnl_pct:+.4f}%) | 出场: {exit_reason}")
+
+            # [研究优化] 记录交易结果用于Kelly计算
+            self._record_trade_result(pnl, is_win)
         else:
             log.warning("  -> 平仓失败")
 
         rpi_rate = (self.rpi_trades / self.total_trades * 100) if self.total_trades > 0 else 0
-        log.info(f"[统计] 交易: {self.total_trades} | RPI: {self.rpi_trades} ({rpi_rate:.1f}%)")
+        win_rate = sum(1 for t in self.recent_trades if t["win"]) / len(self.recent_trades) * 100 if self.recent_trades else 0
+        log.info(f"[统计] 交易: {self.total_trades} | RPI: {self.rpi_trades} ({rpi_rate:.1f}%) | 胜率: {win_rate:.1f}% | 累计PnL: ${self.total_pnl:.4f}")
 
         return True, f"周期完成 ({exit_reason})"
 
@@ -1288,6 +1635,43 @@ async def main():
     config.dynamic_stop_loss = os.getenv("DYNAMIC_STOP_LOSS", "true").lower() == "true"
     config.stop_loss_spread_multiplier = float(os.getenv("STOP_LOSS_MULTIPLIER", "2.0"))
     log.info(f"动态止损: {'开启' if config.dynamic_stop_loss else '关闭'} (倍数: {config.stop_loss_spread_multiplier}x)")
+
+    # ===== 研究优化参数 =====
+    log.info("")
+    log.info("=== 研究优化参数 ===")
+
+    # 平仓模式
+    config.exit_order_type = os.getenv("EXIT_ORDER_TYPE", "limit")  # market 或 limit
+    log.info(f"平仓模式: {config.exit_order_type} ({'限价单-赚点差' if config.exit_order_type == 'limit' else '市价单-付点差'})")
+
+    # 方向信号阈值
+    config.direction_signal_threshold = float(os.getenv("DIRECTION_SIGNAL_THRESHOLD", "0.3"))
+    log.info(f"方向信号阈值: {config.direction_signal_threshold}")
+
+    # 风险收益比
+    config.risk_reward_ratio = float(os.getenv("RISK_REWARD_RATIO", "2.0"))
+    log.info(f"风险收益比: 1:{config.risk_reward_ratio}")
+
+    # 时段过滤
+    config.time_filter_enabled = os.getenv("TIME_FILTER", "true").lower() == "true"
+    config.optimal_hours_start = int(os.getenv("OPTIMAL_HOURS_START", "8"))
+    config.optimal_hours_end = int(os.getenv("OPTIMAL_HOURS_END", "21"))
+    config.weekend_multiplier = float(os.getenv("WEEKEND_MULTIPLIER", "0.5"))
+    log.info(f"时段过滤: {'开启' if config.time_filter_enabled else '关闭'} (UTC {config.optimal_hours_start}:00-{config.optimal_hours_end}:00, 周末x{config.weekend_multiplier})")
+
+    # Kelly准则
+    config.kelly_enabled = os.getenv("KELLY_ENABLED", "true").lower() == "true"
+    config.kelly_fraction = float(os.getenv("KELLY_FRACTION", "0.25"))
+    config.max_position_pct = float(os.getenv("MAX_POSITION_PCT", "0.20"))
+    log.info(f"Kelly准则: {'开启' if config.kelly_enabled else '关闭'} (分数: {config.kelly_fraction}, 最大仓位: {config.max_position_pct:.0%})")
+
+    # 回撤控制
+    config.drawdown_control_enabled = os.getenv("DRAWDOWN_CONTROL", "true").lower() == "true"
+    config.max_daily_loss_pct = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
+    config.max_total_loss_pct = float(os.getenv("MAX_TOTAL_LOSS_PCT", "0.10"))
+    log.info(f"回撤控制: {'开启' if config.drawdown_control_enabled else '关闭'} (日内: {config.max_daily_loss_pct:.0%}, 总体: {config.max_total_loss_pct:.0%})")
+
+    log.info("=" * 30)
 
     # 创建并运行机器人
     bot = RPIBot(client, config, account_manager)
