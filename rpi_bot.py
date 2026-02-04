@@ -29,6 +29,8 @@ from typing import Optional, Dict, Any, List
 from decimal import Decimal, ROUND_DOWN
 
 from dotenv import load_dotenv
+from collections import deque
+import numpy as np
 
 # 全局退出标志
 _shutdown_requested = False
@@ -126,6 +128,25 @@ class RPIConfig:
     trailing_trigger_rr: float = 1.0  # 触发尾随的R/R倍数 (1.0 = 达到1:1时开始尾随)
     trailing_distance_pct: float = 0.5  # 尾随距离 (占止损的百分比, 0.5 = 0.5R)
 
+    # ===== 量化信号增强 (v2.2) =====
+    quant_signals_enabled: bool = True  # 是否启用量化信号融合
+    rsi_enabled: bool = True  # 是否使用RSI指标
+    rsi_period: int = 14  # RSI周期
+    rsi_oversold: float = 30.0  # RSI超卖阈值
+    rsi_overbought: float = 70.0  # RSI超买阈值
+    vwap_enabled: bool = True  # 是否使用VWAP
+    order_flow_enabled: bool = True  # 是否使用订单流分析
+    signal_consistency_weight: float = 0.8  # 信号一致性权重
+    min_signal_strength: float = 0.5  # 最小信号强度阈值
+
+    # 自适应止损
+    adaptive_stop_loss: bool = True  # 是否使用自适应止损
+    adaptive_stop_base: float = 0.02  # 基础止损百分比
+    adaptive_stop_volatility_mult: float = 1.5  # 波动率乘数
+
+    # 连续亏损控制
+    max_consecutive_losses: int = 5  # 最大连续亏损次数后暂停
+
     # 运行状态
     enabled: bool = True
 
@@ -143,6 +164,188 @@ class AccountInfo:
     l2_private_key: str
     l2_address: str
     name: str = ""
+
+
+# =============================================================================
+# 量化信号模块 (v2.2)
+# =============================================================================
+
+class QuantSignalState:
+    """量化信号状态 - 存储历史数据用于计算RSI、VWAP等指标"""
+
+    def __init__(self, rsi_period: int = 14, max_history: int = 100):
+        self.rsi_period = rsi_period
+        # 价格历史
+        self.price_history = deque(maxlen=max_history)
+        self.spread_history = deque(maxlen=max_history)
+        self.imbalance_history = deque(maxlen=max_history)
+        # RSI计算
+        self.rsi_gains = deque(maxlen=rsi_period)
+        self.rsi_losses = deque(maxlen=rsi_period)
+        self.last_price = None
+        # VWAP计算
+        self.vwap_volume = 0.0
+        self.vwap_value = 0.0
+        self.session_start_time = time.time()
+        # 订单流
+        self.buy_volume_history = deque(maxlen=50)
+        self.sell_volume_history = deque(maxlen=50)
+        # 波动率历史
+        self.price_changes = deque(maxlen=50)
+        # 连续亏损计数
+        self.consecutive_losses = 0
+        self.session_trades = 0
+        self.session_wins = 0
+
+    def update_price(self, price: float, volume: float = 0) -> None:
+        """更新价格数据"""
+        now = time.time()
+        self.price_history.append((now, price))
+
+        # 更新RSI
+        if self.last_price is not None:
+            change = price - self.last_price
+            if change > 0:
+                self.rsi_gains.append(change)
+                self.rsi_losses.append(0)
+            else:
+                self.rsi_gains.append(0)
+                self.rsi_losses.append(abs(change))
+            # 记录价格变化百分比
+            self.price_changes.append(abs(change / self.last_price * 100))
+
+        # 更新VWAP
+        if volume > 0:
+            self.vwap_volume += volume
+            self.vwap_value += price * volume
+
+        self.last_price = price
+
+    def update_orderbook(self, imbalance: float, spread_pct: float) -> None:
+        """更新订单簿数据"""
+        self.imbalance_history.append(imbalance)
+        self.spread_history.append(spread_pct)
+
+    def update_trade_flow(self, buy_volume: float, sell_volume: float) -> None:
+        """更新交易流数据"""
+        self.buy_volume_history.append(buy_volume)
+        self.sell_volume_history.append(sell_volume)
+
+    def record_trade_result(self, is_win: bool) -> None:
+        """记录交易结果"""
+        self.session_trades += 1
+        if is_win:
+            self.session_wins += 1
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+
+    def get_rsi(self) -> float:
+        """计算RSI(14)"""
+        if len(self.rsi_gains) < self.rsi_period:
+            return 50.0  # 数据不足返回中性值
+
+        avg_gain = sum(self.rsi_gains) / self.rsi_period
+        avg_loss = sum(self.rsi_losses) / self.rsi_period
+
+        if avg_loss == 0:
+            return 100.0
+
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    def get_vwap(self) -> Optional[float]:
+        """获取VWAP"""
+        if self.vwap_volume > 0:
+            return self.vwap_value / self.vwap_volume
+        return self.last_price
+
+    def get_order_flow_imbalance(self) -> float:
+        """获取订单流不平衡度 (-1 到 1)"""
+        if len(self.buy_volume_history) < 5:
+            return 0.0
+
+        recent_buys = sum(list(self.buy_volume_history)[-10:])
+        recent_sells = sum(list(self.sell_volume_history)[-10:])
+        total = recent_buys + recent_sells
+
+        if total == 0:
+            return 0.0
+
+        return (recent_buys - recent_sells) / total
+
+    def get_price_momentum(self, lookback_seconds: int = 30) -> float:
+        """计算价格动量 (过去N秒的价格变化率%)"""
+        if len(self.price_history) < 2:
+            return 0.0
+
+        now_price = self.price_history[-1][1]
+        target_time = time.time() - lookback_seconds
+
+        old_price = now_price
+        for ts, price in self.price_history:
+            if ts <= target_time:
+                old_price = price
+                break
+
+        if old_price == 0:
+            return 0.0
+
+        return (now_price - old_price) / old_price * 100
+
+    def get_adaptive_stop_loss(self, base_pct: float, volatility_mult: float) -> float:
+        """计算自适应止损百分比"""
+        if len(self.price_changes) < 10:
+            return base_pct
+
+        # 计算近期波动率
+        volatility = float(np.std(list(self.price_changes)))
+        dynamic_stop = base_pct + volatility * volatility_mult
+
+        # 限制在合理范围
+        return min(max(dynamic_stop, 0.01), 0.05)
+
+    def get_spread_zscore(self) -> float:
+        """计算spread的Z-score（异常检测）"""
+        if len(self.spread_history) < 10:
+            return 0.0
+
+        spreads = list(self.spread_history)
+        mean = float(np.mean(spreads))
+        std = float(np.std(spreads))
+
+        if std == 0:
+            return 0.0
+
+        return (spreads[-1] - mean) / std
+
+    def should_pause_trading(self, max_consecutive: int) -> tuple[bool, str]:
+        """检查是否应该暂停交易"""
+        if self.consecutive_losses >= max_consecutive:
+            return True, f"连续亏损 {self.consecutive_losses} 次"
+        return False, ""
+
+    def get_session_stats(self) -> dict:
+        """获取会话统计"""
+        return {
+            'trades': self.session_trades,
+            'wins': self.session_wins,
+            'win_rate': self.session_wins / self.session_trades if self.session_trades > 0 else 0,
+            'consecutive_losses': self.consecutive_losses,
+            'rsi': self.get_rsi(),
+            'vwap': self.get_vwap(),
+            'momentum': self.get_price_momentum()
+        }
+
+    def reset_session(self) -> None:
+        """重置会话数据（新的一天）"""
+        self.consecutive_losses = 0
+        self.session_trades = 0
+        self.session_wins = 0
+        self.vwap_volume = 0.0
+        self.vwap_value = 0.0
+        self.session_start_time = time.time()
 
 
 # =============================================================================
@@ -844,6 +1047,9 @@ class RPIBot:
         self.recent_trades: List[Dict] = []  # 最近交易记录用于Kelly计算
         self.total_pnl: float = 0.0
 
+        # v2.2 量化信号状态
+        self.quant_state = QuantSignalState(rsi_period=config.rsi_period)
+
         if self.account_manager:
             self.rate_state = self.account_manager.get_current_rate_state()
 
@@ -922,6 +1128,9 @@ class RPIBot:
         # 只保留最近100笔交易
         if len(self.recent_trades) > 100:
             self.recent_trades = self.recent_trades[-100:]
+
+        # v2.2: 更新量化信号状态
+        self.quant_state.record_trade_result(win)
 
     def _check_trading_time(self) -> tuple[bool, float, str]:
         """
@@ -1031,22 +1240,123 @@ class RPIBot:
 
         return True, ""
 
-    def _get_direction_signal(self, imbalance: Optional[float]) -> tuple[str, float]:
+    def _get_direction_signal(self, imbalance: Optional[float], current_price: float = 0) -> tuple[str, float, dict]:
         """
-        基于订单簿不平衡度获取方向信号
-        返回: (方向, 置信度)
-        """
-        if imbalance is None:
-            return "NEUTRAL", 0.0
+        v2.2 量化信号融合方向判断
 
+        综合以下信号:
+        1. 订单簿不平衡 (30%)
+        2. 订单流不平衡 (30%)
+        3. RSI超买超卖 (20%)
+        4. VWAP位置 (20%)
+
+        返回: (方向, 信号强度, 详细信息)
+        """
+        details = {}
+
+        # 如果禁用量化信号，使用原逻辑
+        if not self.config.quant_signals_enabled:
+            if imbalance is None:
+                return "NEUTRAL", 0.0, {}
+            threshold = self.config.direction_signal_threshold
+            if imbalance > threshold:
+                return "LONG", abs(imbalance), {'imbalance': imbalance}
+            elif imbalance < -threshold:
+                return "SHORT", abs(imbalance), {'imbalance': imbalance}
+            else:
+                return "NEUTRAL", abs(imbalance), {'imbalance': imbalance}
+
+        # ========== 量化信号融合 ==========
+        direction_score = 0.0
+
+        # 1. 订单簿不平衡 (权重 30%)
+        if imbalance is not None:
+            direction_score += imbalance * 0.3
+            details['imbalance'] = imbalance
+
+        # 2. 订单流不平衡 (权重 30%)
+        if self.config.order_flow_enabled:
+            ofi = self.quant_state.get_order_flow_imbalance()
+            direction_score += ofi * 0.3
+            details['order_flow'] = ofi
+
+        # 3. RSI信号 (权重 20%)
+        rsi_signal = 0.0
+        if self.config.rsi_enabled:
+            rsi = self.quant_state.get_rsi()
+            details['rsi'] = rsi
+
+            if rsi < self.config.rsi_oversold:
+                # 超卖 → 做多信号
+                rsi_signal = (self.config.rsi_oversold - rsi) / self.config.rsi_oversold
+            elif rsi > self.config.rsi_overbought:
+                # 超买 → 做空信号
+                rsi_signal = -(rsi - self.config.rsi_overbought) / (100 - self.config.rsi_overbought)
+
+            direction_score += rsi_signal * 0.2
+            details['rsi_signal'] = rsi_signal
+
+        # 4. VWAP位置信号 (权重 20%)
+        vwap_signal = 0.0
+        if self.config.vwap_enabled and current_price > 0:
+            vwap = self.quant_state.get_vwap()
+            if vwap and vwap > 0:
+                vwap_position = (current_price - vwap) / vwap * 100
+                details['vwap'] = vwap
+                details['vwap_position'] = vwap_position
+
+                momentum = self.quant_state.get_price_momentum(30)
+                details['momentum'] = momentum
+
+                # 价格在VWAP下方 + 上涨动量 = 做多
+                # 价格在VWAP上方 + 下跌动量 = 做空
+                if vwap_position < -0.05 and momentum > 0:
+                    vwap_signal = min(abs(vwap_position) * 5, 1.0)
+                elif vwap_position > 0.05 and momentum < 0:
+                    vwap_signal = -min(abs(vwap_position) * 5, 1.0)
+
+                direction_score += vwap_signal * 0.2
+                details['vwap_signal'] = vwap_signal
+
+        # ========== 信号一致性检查 ==========
+        signals = [
+            imbalance if imbalance else 0,
+            self.quant_state.get_order_flow_imbalance() if self.config.order_flow_enabled else 0,
+            rsi_signal,
+            vwap_signal
+        ]
+
+        positive = sum(1 for s in signals if s > 0.1)
+        negative = sum(1 for s in signals if s < -0.1)
+        consistency = max(positive, negative) / len([s for s in signals if abs(s) > 0.05]) if any(abs(s) > 0.05 for s in signals) else 0
+
+        details['consistency'] = consistency
+        details['direction_score'] = direction_score
+
+        # ========== 计算最终信号强度 ==========
+        raw_strength = abs(direction_score)
+
+        # 应用一致性权重
+        raw_strength *= (consistency * self.config.signal_consistency_weight + (1 - self.config.signal_consistency_weight))
+
+        # Spread异常检测 - 高spread时降低信号强度
+        spread_z = self.quant_state.get_spread_zscore()
+        if spread_z > 2:
+            raw_strength *= 0.5
+            details['spread_penalty'] = True
+
+        strength = min(raw_strength, 1.0)
+        details['final_strength'] = strength
+
+        # ========== 确定方向 ==========
         threshold = self.config.direction_signal_threshold
 
-        if imbalance > threshold:
-            return "LONG", abs(imbalance)
-        elif imbalance < -threshold:
-            return "SHORT", abs(imbalance)
+        if direction_score > threshold and strength >= self.config.min_signal_strength:
+            return "LONG", strength, details
+        elif direction_score < -threshold and strength >= self.config.min_signal_strength:
+            return "SHORT", strength, details
         else:
-            return "NEUTRAL", abs(imbalance)
+            return "NEUTRAL", strength, details
 
     async def run_rpi_cycle(self) -> tuple[bool, str]:
         """
@@ -1138,16 +1448,39 @@ class RPIBot:
                 if new_bbo:
                     ask = new_bbo["ask"]
 
-        # 5. [研究优化] 订单簿分析 + 方向信号
+        # 5. [v2.2] 更新量化信号状态
+        mid_price = (bid + ask) / 2
+        self.quant_state.update_price(mid_price)
+        self.quant_state.update_orderbook(0, spread_pct)  # imbalance稍后更新
+
+        # 5.1 [v2.2] 连续亏损检查
+        if self.config.max_consecutive_losses > 0:
+            should_pause, pause_reason = self.quant_state.should_pause_trading(
+                self.config.max_consecutive_losses
+            )
+            if should_pause:
+                return False, f"[风控] {pause_reason}，暂停交易"
+
+        # 5.2 [研究优化] 订单簿分析 + 量化信号融合
         imbalance = await self.client.get_orderbook_imbalance(market, depth=5)
-        direction, confidence = self._get_direction_signal(imbalance)
+        if imbalance is not None:
+            self.quant_state.update_orderbook(imbalance, spread_pct)
+
+        # v2.2: 使用量化信号融合判断方向
+        direction, confidence, signal_details = self._get_direction_signal(imbalance, mid_price)
 
         if imbalance is not None:
-            log.info(f"[订单簿] 不平衡度: {imbalance:.2f} | 方向: {direction} | 置信度: {confidence:.2f}")
+            # 显示量化信号详情
+            rsi_info = f"RSI={signal_details.get('rsi', 50):.1f}" if self.config.rsi_enabled else ""
+            vwap_info = f"VWAP偏离={signal_details.get('vwap_position', 0):.2f}%" if self.config.vwap_enabled else ""
+            ofi_info = f"OFI={signal_details.get('order_flow', 0):.2f}" if self.config.order_flow_enabled else ""
+
+            log.info(f"[量化信号] imb={imbalance:.2f} | {rsi_info} | {vwap_info} | {ofi_info}")
+            log.info(f"[方向判断] {direction} | 强度: {confidence:.2f} | 一致性: {signal_details.get('consistency', 0):.2f}")
 
             # 使用方向信号阈值
             if direction == "NEUTRAL":
-                return False, f"无明确方向信号 (|{imbalance:.2f}| < {self.config.direction_signal_threshold})"
+                return False, f"无明确方向信号 (强度 {confidence:.2f} < {self.config.min_signal_strength})"
 
             # 支持双向交易 (LONG做多 / SHORT做空)
 
@@ -1248,7 +1581,15 @@ class RPIBot:
             return False, f"余额不足: {balance:.2f} < {required:.2f} USD"
 
         # 9. [优化] 计算止盈止损 (使用风险收益比，并补偿spread)
-        if self.config.dynamic_stop_loss:
+        # v2.2: 优先使用自适应止损（基于波动率）
+        if self.config.adaptive_stop_loss:
+            # 自适应止损 = 基础值 + 波动率 * 乘数
+            stop_loss_pct = self.quant_state.get_adaptive_stop_loss(
+                self.config.adaptive_stop_base,
+                self.config.adaptive_stop_volatility_mult
+            )
+            log.info(f"[自适应止损] {stop_loss_pct:.3f}% (基础{self.config.adaptive_stop_base:.2f}% + 波动率调整)")
+        elif self.config.dynamic_stop_loss:
             # 动态止损 = spread * 倍数
             dynamic_stop_pct = spread_pct * self.config.stop_loss_spread_multiplier
             stop_loss_pct = max(0.01, min(dynamic_stop_pct, 0.05))
@@ -1908,6 +2249,27 @@ async def main():
     config.trailing_trigger_rr = float(os.getenv("TRAILING_TRIGGER_RR", "1.0"))
     config.trailing_distance_pct = float(os.getenv("TRAILING_DISTANCE_PCT", "0.5"))
     log.info(f"尾随止盈: {'开启' if config.trailing_stop_enabled else '关闭'} (触发: {config.trailing_trigger_rr}R, 距离: {config.trailing_distance_pct}R)")
+
+    # v2.2 量化信号增强
+    config.quant_signals_enabled = os.getenv("QUANT_SIGNALS", "true").lower() == "true"
+    config.rsi_enabled = os.getenv("RSI_ENABLED", "true").lower() == "true"
+    config.rsi_period = int(os.getenv("RSI_PERIOD", "14"))
+    config.rsi_oversold = float(os.getenv("RSI_OVERSOLD", "30"))
+    config.rsi_overbought = float(os.getenv("RSI_OVERBOUGHT", "70"))
+    config.vwap_enabled = os.getenv("VWAP_ENABLED", "true").lower() == "true"
+    config.order_flow_enabled = os.getenv("ORDER_FLOW_ENABLED", "true").lower() == "true"
+    config.min_signal_strength = float(os.getenv("MIN_SIGNAL_STRENGTH", "0.5"))
+    log.info(f"量化信号: {'开启' if config.quant_signals_enabled else '关闭'} (RSI={config.rsi_enabled}, VWAP={config.vwap_enabled}, OFI={config.order_flow_enabled})")
+
+    # 自适应止损
+    config.adaptive_stop_loss = os.getenv("ADAPTIVE_STOP_LOSS", "true").lower() == "true"
+    config.adaptive_stop_base = float(os.getenv("ADAPTIVE_STOP_BASE", "0.02"))
+    config.adaptive_stop_volatility_mult = float(os.getenv("ADAPTIVE_STOP_VOLATILITY_MULT", "1.5"))
+    log.info(f"自适应止损: {'开启' if config.adaptive_stop_loss else '关闭'} (基础: {config.adaptive_stop_base:.1%}, 波动乘数: {config.adaptive_stop_volatility_mult}x)")
+
+    # 连续亏损控制
+    config.max_consecutive_losses = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "5"))
+    log.info(f"连续亏损限制: {config.max_consecutive_losses} 次")
 
     log.info("=" * 30)
 
