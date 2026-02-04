@@ -146,6 +146,9 @@ class RPIConfig:
 
     # 连续亏损控制
     max_consecutive_losses: int = 5  # 最大连续亏损次数后暂停
+    cooldown_seconds: int = 300  # 冷却时间（秒），默认5分钟
+    cooldown_recovery_spread: float = 0.008  # 恢复交易需要的spread条件
+    cooldown_recovery_imbalance: float = 0.4  # 恢复交易需要的imbalance条件
 
     # 运行状态
     enabled: bool = True
@@ -196,6 +199,9 @@ class QuantSignalState:
         self.consecutive_losses = 0
         self.session_trades = 0
         self.session_wins = 0
+        # 冷却机制
+        self.cooldown_start_time: Optional[float] = None
+        self.is_in_cooldown: bool = False
 
     def update_price(self, price: float, volume: float = 0) -> None:
         """更新价格数据"""
@@ -320,11 +326,78 @@ class QuantSignalState:
 
         return (spreads[-1] - mean) / std
 
-    def should_pause_trading(self, max_consecutive: int) -> tuple[bool, str]:
-        """检查是否应该暂停交易"""
+    def should_pause_trading(self, max_consecutive: int, cooldown_seconds: int = 300) -> tuple[bool, str]:
+        """
+        检查是否应该暂停交易，支持自动冷却恢复
+
+        Returns:
+            (should_pause, reason)
+        """
+        # 检查是否触发冷却
         if self.consecutive_losses >= max_consecutive:
-            return True, f"连续亏损 {self.consecutive_losses} 次"
+            if not self.is_in_cooldown:
+                # 刚触发冷却，记录开始时间
+                self.cooldown_start_time = time.time()
+                self.is_in_cooldown = True
+                return True, f"连续亏损 {self.consecutive_losses} 次，进入冷却期 {cooldown_seconds}秒"
+
+            # 已在冷却中，检查是否可以恢复
+            if self.cooldown_start_time:
+                elapsed = time.time() - self.cooldown_start_time
+                remaining = cooldown_seconds - elapsed
+
+                if elapsed >= cooldown_seconds:
+                    # 冷却时间到，但需要等待市场条件检查（在外部进行）
+                    return True, f"冷却期结束，等待市场条件恢复..."
+                else:
+                    return True, f"冷却中... 剩余 {int(remaining)} 秒"
+
         return False, ""
+
+    def check_recovery_conditions(self, spread_pct: float, imbalance: float,
+                                   required_spread: float, required_imbalance: float) -> tuple[bool, str]:
+        """
+        检查是否满足恢复交易的市场条件
+
+        Args:
+            spread_pct: 当前spread百分比
+            imbalance: 当前订单簿不平衡度
+            required_spread: 要求的spread上限
+            required_imbalance: 要求的imbalance绝对值下限
+
+        Returns:
+            (can_recover, reason)
+        """
+        if not self.is_in_cooldown:
+            return True, "未在冷却中"
+
+        conditions_met = []
+        conditions_failed = []
+
+        # 检查spread条件
+        if spread_pct <= required_spread:
+            conditions_met.append(f"spread={spread_pct:.4f}%<=限制{required_spread}%")
+        else:
+            conditions_failed.append(f"spread={spread_pct:.4f}%>限制{required_spread}%")
+
+        # 检查imbalance条件（要求有明确方向）
+        if abs(imbalance) >= required_imbalance:
+            conditions_met.append(f"|imbalance|={abs(imbalance):.2f}>=要求{required_imbalance}")
+        else:
+            conditions_failed.append(f"|imbalance|={abs(imbalance):.2f}<要求{required_imbalance}")
+
+        if not conditions_failed:
+            # 所有条件满足，恢复交易
+            self.reset_cooldown()
+            return True, f"市场条件恢复: {', '.join(conditions_met)}"
+        else:
+            return False, f"等待市场条件: {', '.join(conditions_failed)}"
+
+    def reset_cooldown(self) -> None:
+        """重置冷却状态"""
+        self.is_in_cooldown = False
+        self.cooldown_start_time = None
+        self.consecutive_losses = 0  # 重置连续亏损计数
 
     def get_session_stats(self) -> dict:
         """获取会话统计"""
@@ -1453,13 +1526,39 @@ class RPIBot:
         self.quant_state.update_price(mid_price)
         self.quant_state.update_orderbook(0, spread_pct)  # imbalance稍后更新
 
-        # 5.1 [v2.2] 连续亏损检查
+        # 5.1 [v2.2] 连续亏损检查 + 自动冷却恢复
         if self.config.max_consecutive_losses > 0:
             should_pause, pause_reason = self.quant_state.should_pause_trading(
-                self.config.max_consecutive_losses
+                self.config.max_consecutive_losses,
+                self.config.cooldown_seconds
             )
             if should_pause:
-                return False, f"[风控] {pause_reason}，暂停交易"
+                # 检查冷却时间是否已过
+                if self.quant_state.cooldown_start_time:
+                    elapsed = time.time() - self.quant_state.cooldown_start_time
+                    if elapsed >= self.config.cooldown_seconds:
+                        # 冷却时间已过，检查市场条件是否满足恢复
+                        # 需要先获取imbalance
+                        recovery_imbalance = await self.client.get_orderbook_imbalance(market, depth=5)
+                        if recovery_imbalance is None:
+                            recovery_imbalance = 0
+
+                        can_recover, recovery_reason = self.quant_state.check_recovery_conditions(
+                            spread_pct=spread_pct,
+                            imbalance=recovery_imbalance,
+                            required_spread=self.config.cooldown_recovery_spread,
+                            required_imbalance=self.config.cooldown_recovery_imbalance
+                        )
+
+                        if can_recover:
+                            log.info(f"[冷却恢复] {recovery_reason}，自动恢复交易")
+                            # 继续执行后续交易逻辑
+                        else:
+                            return False, f"[风控] 冷却期结束，{recovery_reason}"
+                    else:
+                        return False, f"[风控] {pause_reason}"
+                else:
+                    return False, f"[风控] {pause_reason}"
 
         # 5.2 [研究优化] 订单簿分析 + 量化信号融合
         imbalance = await self.client.get_orderbook_imbalance(market, depth=5)
@@ -2267,9 +2366,13 @@ async def main():
     config.adaptive_stop_volatility_mult = float(os.getenv("ADAPTIVE_STOP_VOLATILITY_MULT", "1.5"))
     log.info(f"自适应止损: {'开启' if config.adaptive_stop_loss else '关闭'} (基础: {config.adaptive_stop_base:.1%}, 波动乘数: {config.adaptive_stop_volatility_mult}x)")
 
-    # 连续亏损控制
+    # 连续亏损控制 + 自动冷却恢复
     config.max_consecutive_losses = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "5"))
-    log.info(f"连续亏损限制: {config.max_consecutive_losses} 次")
+    config.cooldown_seconds = int(os.getenv("COOLDOWN_SECONDS", "300"))
+    config.cooldown_recovery_spread = float(os.getenv("COOLDOWN_RECOVERY_SPREAD", "0.008"))
+    config.cooldown_recovery_imbalance = float(os.getenv("COOLDOWN_RECOVERY_IMBALANCE", "0.4"))
+    log.info(f"连续亏损限制: {config.max_consecutive_losses} 次 | 冷却时间: {config.cooldown_seconds}秒")
+    log.info(f"恢复条件: spread<={config.cooldown_recovery_spread}%, |imbalance|>={config.cooldown_recovery_imbalance}")
 
     log.info("=" * 30)
 
