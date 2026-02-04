@@ -1148,16 +1148,15 @@ class RPIBot:
             if direction == "NEUTRAL":
                 return False, f"无明确方向信号 (|{imbalance:.2f}| < {self.config.direction_signal_threshold})"
 
-            # 只做多 (因为我们的策略是买入后等待上涨)
-            if direction == "SHORT":
-                return False, f"卖压过大，跳过 (imbalance={imbalance:.2f})"
+            # 支持双向交易 (LONG做多 / SHORT做空)
 
-        # 6. [简化] 入场模式判断
+        # 6. [简化] 入场模式判断 (支持双向)
         entry_signal = False
         entry_reason = ""
+        trade_direction = direction  # LONG 或 SHORT
 
         if self.config.entry_mode == "trend" or self.config.entry_mode == "hybrid":
-            # 趋势跟随：连续上涨才入场
+            # 趋势跟随：连续上涨做多，连续下跌做空
             if self.config.trend_filter_enabled:
                 prices = [bid]
                 for i in range(2):
@@ -1168,20 +1167,32 @@ class RPIBot:
 
                 if len(prices) >= 3:
                     trend_up = prices[1] >= prices[0] and prices[2] >= prices[1]
+                    trend_down = prices[1] <= prices[0] and prices[2] <= prices[1]
                     total_change = prices[2] - prices[0]
 
-                    if trend_up and total_change >= 0:
+                    # LONG: 趋势上涨 + 买压
+                    if direction == "LONG" and trend_up and total_change >= 0:
                         entry_signal = True
-                        entry_reason = f"趋势上涨+买压: +${total_change:.2f}, imb={imbalance:.2f}"
+                        entry_reason = f"[做多] 趋势上涨+买压: +${total_change:.2f}, imb={imbalance:.2f}"
+                        bid = prices[2]
+                        if bbo_check:
+                            ask = bbo_check["ask"]
+                    # SHORT: 趋势下跌 + 卖压
+                    elif direction == "SHORT" and trend_down and total_change <= 0:
+                        entry_signal = True
+                        entry_reason = f"[做空] 趋势下跌+卖压: {total_change:.2f}, imb={imbalance:.2f}"
                         bid = prices[2]
                         if bbo_check:
                             ask = bbo_check["ask"]
             else:
                 entry_signal = True
-                entry_reason = f"买压信号: imb={imbalance:.2f}"
+                if direction == "LONG":
+                    entry_reason = f"[做多] 买压信号: imb={imbalance:.2f}"
+                else:
+                    entry_reason = f"[做空] 卖压信号: imb={imbalance:.2f}"
 
         if self.config.entry_mode == "mean_reversion" or (self.config.entry_mode == "hybrid" and not entry_signal):
-            # 均值回归：价格下跌 + 强买压 = 可能反弹
+            # 均值回归：价格下跌+强买压=做多反弹，价格上涨+强卖压=做空回调
             prices = [bid]
             for i in range(2):
                 await asyncio.sleep(0.2)
@@ -1191,15 +1202,27 @@ class RPIBot:
 
             if len(prices) >= 3:
                 price_dropped = prices[2] < prices[0]
+                price_rose = prices[2] > prices[0]
+
+                # 做多均值回归: 价格跌 + 强买压
                 if price_dropped and imbalance is not None and imbalance > 0.3:
                     entry_signal = True
-                    entry_reason = f"均值回归: 跌${prices[0]-prices[2]:.2f}, 强买压={imbalance:.2f}"
+                    trade_direction = "LONG"
+                    entry_reason = f"[做多] 均值回归: 跌${prices[0]-prices[2]:.2f}, 强买压={imbalance:.2f}"
+                    bid = prices[2]
+                    if bbo_check:
+                        ask = bbo_check["ask"]
+                # 做空均值回归: 价格涨 + 强卖压
+                elif price_rose and imbalance is not None and imbalance < -0.3:
+                    entry_signal = True
+                    trade_direction = "SHORT"
+                    entry_reason = f"[做空] 均值回归: 涨${prices[2]-prices[0]:.2f}, 强卖压={imbalance:.2f}"
                     bid = prices[2]
                     if bbo_check:
                         ask = bbo_check["ask"]
 
         if not entry_signal:
-            return False, f"无入场信号 (模式: {self.config.entry_mode})"
+            return False, f"无入场信号 (模式: {self.config.entry_mode}, 方向: {direction})"
 
         log.info(f"[入场] {entry_reason}")
 
@@ -1233,57 +1256,79 @@ class RPIBot:
             stop_loss_pct = self.config.stop_loss_pct
 
         # 使用风险收益比计算止盈
-        # 重要: 由于我们在ask买入，检查bid止盈，需要补偿spread
-        # 实际收益 = (bid - ask) / ask = (target_bid - entry_ask) / entry_ask
-        # 要获得真实的R/R，止盈目标需要加上spread补偿
+        # 重要: 需要补偿spread
+        # LONG: 在ask买入，检查bid止盈 -> 止盈需要加spread
+        # SHORT: 在bid卖出，检查ask止盈 -> 止盈也需要加spread
         raw_take_profit_pct = stop_loss_pct * self.config.risk_reward_ratio
-        # 补偿spread: 止盈目标 = 基础止盈 + spread (因为买入是ask，卖出看bid)
         take_profit_pct = raw_take_profit_pct + spread_pct
         log.info(f"[风险收益] 止盈={take_profit_pct:.3f}% (含spread补偿{spread_pct:.3f}%) : 止损={stop_loss_pct:.3f}% (真实R/R={self.config.risk_reward_ratio})")
 
-        # 9. 市价买入 (TAKER -> 获得 RPI)
-        log.info(f"[开仓] 市价买入 {size} BTC @ ~${ask:.1f}...")
-        buy_result = await self.client.place_market_order(
+        # 9. 开仓 (TAKER -> 获得 RPI)
+        # LONG: BUY @ ask, SHORT: SELL @ bid
+        if trade_direction == "LONG":
+            open_side = "BUY"
+            entry_price = ask
+            log.info(f"[开仓] 做多 市价买入 {size} BTC @ ~${ask:.1f}...")
+        else:  # SHORT
+            open_side = "SELL"
+            entry_price = bid
+            log.info(f"[开仓] 做空 市价卖出 {size} BTC @ ~${bid:.1f}...")
+
+        open_result = await self.client.place_market_order(
             market=market,
-            side="BUY",
+            side=open_side,
             size=size,
             reduce_only=False
         )
 
-        if not buy_result:
-            return False, "买入失败"
+        if not open_result:
+            return False, f"开仓失败 ({trade_direction})"
 
         self._record_trade()
-        entry_price = ask
 
         # 检查 RPI
-        buy_flags = buy_result.get("flags", [])
-        if "rpi" in [f.lower() for f in buy_flags]:
+        open_flags = open_result.get("flags", [])
+        if "rpi" in [f.lower() for f in open_flags]:
             self.rpi_trades += 1
-            log.info(f"  -> RPI! flags={buy_flags}")
+            log.info(f"  -> RPI! flags={open_flags}")
         else:
-            log.info(f"  -> flags={buy_flags}")
+            log.info(f"  -> flags={open_flags}")
 
-        # 11. 等待出场 (支持尾随止盈)
+        # 11. 等待出场 (支持尾随止盈，支持双向)
+        # LONG: 看bid价格, SHORT: 看ask价格
         best_bid = bid
+        best_ask = ask
+        check_price = bid if trade_direction == "LONG" else ask
         exit_reason = "instant"
 
         if self.config.max_wait_seconds <= 0:
             log.info(f"[极速] 立即平仓模式")
         else:
-            target_price = entry_price * (1 + take_profit_pct / 100)
-            stop_price = entry_price * (1 - stop_loss_pct / 100)
+            # 计算止盈止损价格 (方向不同，计算相反)
+            if trade_direction == "LONG":
+                # LONG: 止盈在上方，止损在下方
+                target_price = entry_price * (1 + take_profit_pct / 100)
+                stop_price = entry_price * (1 - stop_loss_pct / 100)
+                trailing_trigger_price = entry_price * (1 + stop_loss_pct * self.config.trailing_trigger_rr / 100)
+            else:
+                # SHORT: 止盈在下方，止损在上方
+                target_price = entry_price * (1 - take_profit_pct / 100)
+                stop_price = entry_price * (1 + stop_loss_pct / 100)
+                trailing_trigger_price = entry_price * (1 - stop_loss_pct * self.config.trailing_trigger_rr / 100)
 
             # 尾随止盈参数
             trailing_active = False
             trailing_stop_price = stop_price
-            peak_price = entry_price
-            trailing_trigger_price = entry_price * (1 + stop_loss_pct * self.config.trailing_trigger_rr / 100)
+            peak_price = entry_price  # LONG: 最高价, SHORT: 最低价
             trailing_distance = entry_price * (stop_loss_pct * self.config.trailing_distance_pct / 100)
 
-            log.info(f"[等待] 止盈: ${target_price:.1f} (+{take_profit_pct:.3f}%) | 止损: ${stop_price:.1f} (-{stop_loss_pct:.3f}%)")
+            if trade_direction == "LONG":
+                log.info(f"[等待-做多] 止盈: ${target_price:.1f} (+{take_profit_pct:.3f}%) | 止损: ${stop_price:.1f} (-{stop_loss_pct:.3f}%)")
+            else:
+                log.info(f"[等待-做空] 止盈: ${target_price:.1f} (-{take_profit_pct:.3f}%) | 止损: ${stop_price:.1f} (+{stop_loss_pct:.3f}%)")
+
             if self.config.trailing_stop_enabled:
-                log.info(f"[尾随] 触发价: ${trailing_trigger_price:.1f} (+{stop_loss_pct * self.config.trailing_trigger_rr:.3f}%)")
+                log.info(f"[尾随] 触发价: ${trailing_trigger_price:.1f}")
 
             wait_start = time.time()
             exit_reason = "timeout"
@@ -1296,59 +1341,102 @@ class RPIBot:
                 new_bbo = await self.client.get_bbo(market)
                 if new_bbo:
                     best_bid = new_bbo["bid"]
+                    best_ask = new_bbo["ask"]
+                    check_price = best_bid if trade_direction == "LONG" else best_ask
 
-                    # 更新最高价
-                    if best_bid > peak_price:
-                        peak_price = best_bid
+                    if trade_direction == "LONG":
+                        # LONG: 追踪最高价
+                        if check_price > peak_price:
+                            peak_price = check_price
 
-                        # 检查是否触发尾随
-                        if self.config.trailing_stop_enabled and not trailing_active and best_bid >= trailing_trigger_price:
-                            trailing_active = True
-                            trailing_stop_price = peak_price - trailing_distance
-                            log.info(f"[尾随激活] 峰值: ${peak_price:.1f}, 尾随止损: ${trailing_stop_price:.1f}")
+                            # 检查是否触发尾随
+                            if self.config.trailing_stop_enabled and not trailing_active and check_price >= trailing_trigger_price:
+                                trailing_active = True
+                                trailing_stop_price = peak_price - trailing_distance
+                                log.info(f"[尾随激活] 峰值: ${peak_price:.1f}, 尾随止损: ${trailing_stop_price:.1f}")
 
-                        # 更新尾随止损
-                        if trailing_active:
-                            new_trailing_stop = peak_price - trailing_distance
-                            if new_trailing_stop > trailing_stop_price:
-                                trailing_stop_price = new_trailing_stop
-                                log.info(f"[尾随更新] 峰值: ${peak_price:.1f}, 尾随止损: ${trailing_stop_price:.1f}")
+                            # 更新尾随止损
+                            if trailing_active:
+                                new_trailing_stop = peak_price - trailing_distance
+                                if new_trailing_stop > trailing_stop_price:
+                                    trailing_stop_price = new_trailing_stop
+                                    log.info(f"[尾随更新] 峰值: ${peak_price:.1f}, 尾随止损: ${trailing_stop_price:.1f}")
 
-                    # 检查止盈
-                    if best_bid >= target_price:
-                        log.info(f"[止盈] ${best_bid:.1f} >= ${target_price:.1f}")
-                        exit_reason = "take_profit"
-                        break
+                        # 检查止盈 (价格上涨)
+                        if check_price >= target_price:
+                            log.info(f"[止盈] ${check_price:.1f} >= ${target_price:.1f}")
+                            exit_reason = "take_profit"
+                            break
 
-                    # 检查尾随止损
-                    if trailing_active and best_bid <= trailing_stop_price:
-                        log.info(f"[尾随止盈] ${best_bid:.1f} <= ${trailing_stop_price:.1f} (峰值: ${peak_price:.1f})")
-                        exit_reason = "trailing_stop"
-                        break
+                        # 检查尾随止损
+                        if trailing_active and check_price <= trailing_stop_price:
+                            log.info(f"[尾随止盈] ${check_price:.1f} <= ${trailing_stop_price:.1f} (峰值: ${peak_price:.1f})")
+                            exit_reason = "trailing_stop"
+                            break
 
-                    # 检查普通止损
-                    if best_bid <= stop_price:
-                        log.info(f"[止损] ${best_bid:.1f} <= ${stop_price:.1f}")
-                        exit_reason = "stop_loss"
-                        break
+                        # 检查普通止损 (价格下跌)
+                        if check_price <= stop_price:
+                            log.info(f"[止损] ${check_price:.1f} <= ${stop_price:.1f}")
+                            exit_reason = "stop_loss"
+                            break
+
+                    else:  # SHORT
+                        # SHORT: 追踪最低价
+                        if check_price < peak_price:
+                            peak_price = check_price
+
+                            # 检查是否触发尾随 (价格下跌到触发位)
+                            if self.config.trailing_stop_enabled and not trailing_active and check_price <= trailing_trigger_price:
+                                trailing_active = True
+                                trailing_stop_price = peak_price + trailing_distance
+                                log.info(f"[尾随激活] 谷值: ${peak_price:.1f}, 尾随止损: ${trailing_stop_price:.1f}")
+
+                            # 更新尾随止损 (跟随价格下跌)
+                            if trailing_active:
+                                new_trailing_stop = peak_price + trailing_distance
+                                if new_trailing_stop < trailing_stop_price:
+                                    trailing_stop_price = new_trailing_stop
+                                    log.info(f"[尾随更新] 谷值: ${peak_price:.1f}, 尾随止损: ${trailing_stop_price:.1f}")
+
+                        # 检查止盈 (价格下跌)
+                        if check_price <= target_price:
+                            log.info(f"[止盈] ${check_price:.1f} <= ${target_price:.1f}")
+                            exit_reason = "take_profit"
+                            break
+
+                        # 检查尾随止损 (价格回升)
+                        if trailing_active and check_price >= trailing_stop_price:
+                            log.info(f"[尾随止盈] ${check_price:.1f} >= ${trailing_stop_price:.1f} (谷值: ${peak_price:.1f})")
+                            exit_reason = "trailing_stop"
+                            break
+
+                        # 检查普通止损 (价格上涨)
+                        if check_price >= stop_price:
+                            log.info(f"[止损] ${check_price:.1f} >= ${stop_price:.1f}")
+                            exit_reason = "stop_loss"
+                            break
 
                 await asyncio.sleep(self.config.check_interval)
             else:
-                log.info(f"[超时] {self.config.max_wait_seconds}s, Bid: ${best_bid:.1f}")
+                log.info(f"[超时] {self.config.max_wait_seconds}s, 检查价: ${check_price:.1f}")
 
-        # 12. 平仓 (强制确保平仓成功)
-        sell_result = None
-        actual_exit_price = best_bid
+        # 12. 平仓 (强制确保平仓成功，支持双向)
+        # LONG: SELL平仓, SHORT: BUY平仓
+        close_side = "SELL" if trade_direction == "LONG" else "BUY"
+        close_result = None
+        # LONG看bid平仓, SHORT看ask平仓
+        actual_exit_price = best_bid if trade_direction == "LONG" else best_ask
         max_close_retries = 5  # 最多重试5次
 
         if self.config.exit_order_type == "limit" and exit_reason != "stop_loss":
             # [研究优化] 使用 POST_ONLY 限价单平仓 (赚取点差)
-            log.info(f"[平仓] 限价单卖出 {size} BTC @ ${best_bid:.1f} (POST_ONLY)...")
+            close_price = best_bid if trade_direction == "LONG" else best_ask
+            log.info(f"[平仓] 限价单{close_side} {size} BTC @ ${close_price:.1f} (POST_ONLY)...")
             limit_result = await self.client.place_limit_order(
                 market=market,
-                side="SELL",
+                side=close_side,
                 size=size,
-                price=str(round(best_bid, 1)),
+                price=str(round(close_price, 1)),
                 post_only=True,
                 reduce_only=True
             )
@@ -1358,8 +1446,8 @@ class RPIBot:
                 # 等待成交 (最多3秒，缩短等待时间)
                 fill_result = await self.client.wait_order_fill(order_id, timeout_seconds=3.0)
                 if fill_result:
-                    sell_result = fill_result
-                    actual_exit_price = float(fill_result.get("avg_fill_price", best_bid))
+                    close_result = fill_result
+                    actual_exit_price = float(fill_result.get("avg_fill_price", close_price))
                     log.info(f"  -> 限价单成交 @ ${actual_exit_price:.1f}")
                 else:
                     # 限价单未成交，降级为市价单
@@ -1367,7 +1455,7 @@ class RPIBot:
 
         # 市价单平仓 (作为后备或止损时使用) - 添加重试机制
         for retry in range(max_close_retries):
-            if sell_result:
+            if close_result:
                 break
 
             if retry > 0:
@@ -1378,16 +1466,18 @@ class RPIBot:
             new_bbo = await self.client.get_bbo(market)
             if new_bbo:
                 best_bid = new_bbo["bid"]
+                best_ask = new_bbo["ask"]
 
-            log.info(f"[平仓] 市价卖出 {size} BTC @ ~${best_bid:.1f}...")
-            sell_result = await self.client.place_market_order(
+            close_price = best_bid if trade_direction == "LONG" else best_ask
+            log.info(f"[平仓] 市价{close_side} {size} BTC @ ~${close_price:.1f}...")
+            close_result = await self.client.place_market_order(
                 market=market,
-                side="SELL",
+                side=close_side,
                 size=size,
                 reduce_only=True
             )
 
-            if sell_result:
+            if close_result:
                 break
 
             # 如果市价单失败，检查是否有残留仓位并尝试平掉
@@ -1395,42 +1485,52 @@ class RPIBot:
             if positions:
                 actual_size = positions[0].get("size", size)
                 log.info(f"[平仓] 检测到残留仓位 {actual_size}，尝试平仓...")
-                sell_result = await self.client.place_market_order(
+                close_result = await self.client.place_market_order(
                     market=market,
-                    side="SELL",
-                    size=str(actual_size),
+                    side=close_side,
+                    size=str(abs(float(actual_size))),
                     reduce_only=True
                 )
 
         # 最终检查：确保没有残留仓位
-        if not sell_result:
+        if not close_result:
             log.error(f"[严重] 平仓失败 {max_close_retries} 次，执行强制平仓...")
             await self.client.close_all_positions(market)
             # 再次检查
             positions = await self.client.get_positions(market)
-            if positions and float(positions[0].get("size", 0)) > 0:
+            if positions and abs(float(positions[0].get("size", 0))) > 0:
                 log.error(f"[严重] 仍有残留仓位: {positions[0].get('size')}")
             else:
                 log.info(f"[恢复] 强制平仓成功")
-                sell_result = {"forced": True}
+                close_result = {"forced": True}
 
-        if sell_result:
+        if close_result:
             self._record_trade()
 
             # 检查是否是强制平仓
-            if sell_result.get("forced"):
+            if close_result.get("forced"):
                 log.warning("  -> 强制平仓完成，PnL 可能有误差")
-                # 估算PnL
-                pnl = (best_bid - entry_price) * float(size)
-                pnl_pct = (best_bid - entry_price) / entry_price * 100
+                # 估算PnL (根据方向不同计算)
+                close_price = best_bid if trade_direction == "LONG" else best_ask
+                if trade_direction == "LONG":
+                    pnl = (close_price - entry_price) * float(size)
+                    pnl_pct = (close_price - entry_price) / entry_price * 100
+                else:  # SHORT
+                    pnl = (entry_price - close_price) * float(size)
+                    pnl_pct = (entry_price - close_price) / entry_price * 100
             else:
-                sell_flags = sell_result.get("flags", [])
-                if "rpi" in [f.lower() for f in sell_flags]:
+                close_flags = close_result.get("flags", [])
+                if "rpi" in [f.lower() for f in close_flags]:
                     self.rpi_trades += 1
-                    log.info(f"  -> RPI! flags={sell_flags}")
+                    log.info(f"  -> RPI! flags={close_flags}")
 
-                pnl = (actual_exit_price - entry_price) * float(size)
-                pnl_pct = (actual_exit_price - entry_price) / entry_price * 100
+                # PnL计算 (根据方向不同)
+                if trade_direction == "LONG":
+                    pnl = (actual_exit_price - entry_price) * float(size)
+                    pnl_pct = (actual_exit_price - entry_price) / entry_price * 100
+                else:  # SHORT
+                    pnl = (entry_price - actual_exit_price) * float(size)
+                    pnl_pct = (entry_price - actual_exit_price) / entry_price * 100
 
             is_win = pnl > 0
             log.info(f"  -> PnL: ${pnl:.4f} ({pnl_pct:+.4f}%) | 出场: {exit_reason}")
