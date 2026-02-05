@@ -1774,34 +1774,19 @@ class RPIBot:
                     entry_reason = f"[做空] 卖压信号: imb={imbalance:.2f}"
 
         if self.config.entry_mode == "mean_reversion" or (self.config.entry_mode == "hybrid" and not entry_signal):
-            # 均值回归：价格下跌+强买压=做多反弹，价格上涨+强卖压=做空回调
-            prices = [bid]
-            for i in range(2):
-                await asyncio.sleep(0.2)
-                bbo_check = await self.client.get_bbo(market)
-                if bbo_check:
-                    prices.append(bbo_check["bid"])
+            # v3修复: 均值回归方向已由 _get_direction_signal() 计算
+            # 这里只需要信任其方向判断，不再重复计算
+            # _get_direction_signal() 的均值回归逻辑:
+            #   - 强买压 (imbalance > threshold) -> SHORT (预期回调)
+            #   - 强卖压 (imbalance < -threshold) -> LONG (预期反弹)
 
-            if len(prices) >= 3:
-                price_dropped = prices[2] < prices[0]
-                price_rose = prices[2] > prices[0]
-
-                # 做多均值回归: 价格跌 + 强买压
-                if price_dropped and imbalance is not None and imbalance > 0.3:
-                    entry_signal = True
-                    trade_direction = "LONG"
-                    entry_reason = f"[做多] 均值回归: 跌${prices[0]-prices[2]:.2f}, 强买压={imbalance:.2f}"
-                    bid = prices[2]
-                    if bbo_check:
-                        ask = bbo_check["ask"]
-                # 做空均值回归: 价格涨 + 强卖压
-                elif price_rose and imbalance is not None and imbalance < -0.3:
-                    entry_signal = True
-                    trade_direction = "SHORT"
-                    entry_reason = f"[做空] 均值回归: 涨${prices[2]-prices[0]:.2f}, 强卖压={imbalance:.2f}"
-                    bid = prices[2]
-                    if bbo_check:
-                        ask = bbo_check["ask"]
+            if direction != "NEUTRAL" and imbalance is not None:
+                entry_signal = True
+                trade_direction = direction  # 直接使用 _get_direction_signal() 的结果
+                if direction == "LONG":
+                    entry_reason = f"[做多] 均值回归: 强卖压={imbalance:.2f}, 预期反弹"
+                else:
+                    entry_reason = f"[做空] 均值回归: 强买压={imbalance:.2f}, 预期回调"
 
         if not entry_signal:
             return False, f"无入场信号 (模式: {self.config.entry_mode}, 方向: {direction})"
