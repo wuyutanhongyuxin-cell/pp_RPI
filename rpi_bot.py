@@ -420,6 +420,74 @@ class QuantSignalState:
         self.vwap_value = 0.0
         self.session_start_time = time.time()
 
+    # ========== v3 新增方法 ==========
+
+    def get_spread_percentile(self) -> float:
+        """
+        计算当前spread在历史中的百分位
+        返回: 0-100的百分位数，越低说明当前spread越好
+        """
+        if len(self.spread_history) < 20:
+            return 50.0  # 数据不足返回中位数
+
+        spreads = list(self.spread_history)
+        current = spreads[-1]
+        rank = sum(1 for s in spreads[:-1] if s < current)
+        return (rank / (len(spreads) - 1)) * 100
+
+    def get_atr_pct(self, period: int = 20) -> float:
+        """
+        计算近期ATR百分比 (Average True Range)
+        用于更准确的波动率止损
+        """
+        if len(self.price_history) < period + 1:
+            return 0.02  # 默认2%
+
+        prices = [p[1] for p in list(self.price_history)[-period-1:]]
+
+        # 计算True Range
+        trs = []
+        for i in range(1, len(prices)):
+            high_low = abs(prices[i] - prices[i-1])  # 简化: 用相邻价格差
+            trs.append(high_low)
+
+        if not trs or prices[-1] == 0:
+            return 0.02
+
+        atr = sum(trs) / len(trs)
+        atr_pct = (atr / prices[-1]) * 100
+
+        return atr_pct
+
+    def get_momentum_strength(self, lookback: int = 60) -> float:
+        """
+        计算动量强度 (-1 到 1)
+        正值表示上涨动量，负值表示下跌动量
+        """
+        if len(self.price_history) < 10:
+            return 0.0
+
+        now = time.time()
+        recent_prices = [(t, p) for t, p in self.price_history if now - t <= lookback]
+
+        if len(recent_prices) < 5:
+            return 0.0
+
+        # 计算线性回归斜率
+        x = np.array([i for i in range(len(recent_prices))])
+        y = np.array([p[1] for p in recent_prices])
+
+        # 归一化
+        mean_price = np.mean(y)
+        if mean_price == 0:
+            return 0.0
+
+        slope = np.polyfit(x, y, 1)[0]
+        normalized_slope = slope / mean_price * 100  # 转为百分比
+
+        # 限制在 -1 到 1 之间
+        return max(-1.0, min(1.0, normalized_slope / 0.1))
+
 
 # =============================================================================
 # Paradex API 客户端 (使用 Interactive Token)
@@ -1120,6 +1188,10 @@ class RPIBot:
         self.recent_trades: List[Dict] = []  # 最近交易记录用于Kelly计算
         self.total_pnl: float = 0.0
 
+        # v3: 交易方向和时间追踪（用于额外过滤）
+        self.last_trade_direction: Optional[str] = None
+        self.last_trade_time: Optional[float] = None
+
         # v2.2 量化信号状态
         self.quant_state = QuantSignalState(rsi_period=config.rsi_period)
 
@@ -1315,13 +1387,13 @@ class RPIBot:
 
     def _get_direction_signal(self, imbalance: Optional[float], current_price: float = 0) -> tuple[str, float, dict]:
         """
-        v2.2 量化信号融合方向判断
+        v3: 优化的量化信号融合方向判断
 
-        综合以下信号:
-        1. 订单簿不平衡 (30%)
-        2. 订单流不平衡 (30%)
-        3. RSI超买超卖 (20%)
-        4. VWAP位置 (20%)
+        关键改进:
+        1. 移除重复信号 (OFI与imbalance高度相关)
+        2. 添加spread百分位过滤
+        3. 支持均值回归模式 (反向入场吃回调)
+        4. RSI和VWAP作为辅助确认
 
         返回: (方向, 信号强度, 详细信息)
         """
@@ -1339,38 +1411,47 @@ class RPIBot:
             else:
                 return "NEUTRAL", abs(imbalance), {'imbalance': imbalance}
 
-        # ========== 量化信号融合 ==========
-        direction_score = 0.0
+        # ========== v3 量化信号融合 ==========
 
-        # 1. 订单簿不平衡 (权重 30%)
-        if imbalance is not None:
-            direction_score += imbalance * 0.3
-            details['imbalance'] = imbalance
+        # Step 1: 检查spread是否合适
+        spread_percentile = self.quant_state.get_spread_percentile()
+        details['spread_percentile'] = spread_percentile
 
-        # 2. 订单流不平衡 (权重 30%)
-        if self.config.order_flow_enabled:
-            ofi = self.quant_state.get_order_flow_imbalance()
-            direction_score += ofi * 0.3
-            details['order_flow'] = ofi
+        if spread_percentile > 40:  # spread处于历史60%以上，流动性差
+            return "NEUTRAL", 0.0, {'reason': 'spread过大，等待流动性改善', **details}
 
-        # 3. RSI信号 (权重 20%)
-        rsi_signal = 0.0
+        # Step 2: 订单簿不平衡 (主信号)
+        if imbalance is None:
+            return "NEUTRAL", 0.0, {'reason': '无imbalance数据', **details}
+
+        details['imbalance'] = imbalance
+
+        # Step 3: 检查信号强度
+        if abs(imbalance) < self.config.direction_signal_threshold:
+            return "NEUTRAL", abs(imbalance), {'reason': f'信号不够强 |{imbalance:.2f}| < {self.config.direction_signal_threshold}', **details}
+
+        # Step 4: RSI辅助确认
+        rsi_ok = True
         if self.config.rsi_enabled:
             rsi = self.quant_state.get_rsi()
             details['rsi'] = rsi
 
-            if rsi < self.config.rsi_oversold:
-                # 超卖 → 做多信号
-                rsi_signal = (self.config.rsi_oversold - rsi) / self.config.rsi_oversold
-            elif rsi > self.config.rsi_overbought:
-                # 超买 → 做空信号
-                rsi_signal = -(rsi - self.config.rsi_overbought) / (100 - self.config.rsi_overbought)
+            # 在均值回归模式下，RSI需要配合
+            if self.config.entry_mode == "mean_reversion":
+                # 均值回归做多（卖压后反弹）需要RSI不在超买区
+                if imbalance < 0 and rsi > 70:
+                    rsi_ok = False
+                    details['rsi_filter'] = 'RSI超买，不做多'
+                # 均值回归做空（买压后回调）需要RSI不在超卖区
+                elif imbalance > 0 and rsi < 30:
+                    rsi_ok = False
+                    details['rsi_filter'] = 'RSI超卖，不做空'
 
-            direction_score += rsi_signal * 0.2
-            details['rsi_signal'] = rsi_signal
+        if not rsi_ok:
+            return "NEUTRAL", abs(imbalance), details
 
-        # 4. VWAP位置信号 (权重 20%)
-        vwap_signal = 0.0
+        # Step 5: VWAP位置辅助
+        vwap_ok = True
         if self.config.vwap_enabled and current_price > 0:
             vwap = self.quant_state.get_vwap()
             if vwap and vwap > 0:
@@ -1378,62 +1459,126 @@ class RPIBot:
                 details['vwap'] = vwap
                 details['vwap_position'] = vwap_position
 
-                momentum = self.quant_state.get_price_momentum(30)
-                details['momentum'] = momentum
+                # 均值回归: 不要在价格极端偏离VWAP时入场
+                if abs(vwap_position) > 0.3:  # 偏离VWAP超过0.3%
+                    vwap_ok = False
+                    details['vwap_filter'] = f'偏离VWAP过大: {vwap_position:.2f}%'
 
-                # 价格在VWAP下方 + 上涨动量 = 做多
-                # 价格在VWAP上方 + 下跌动量 = 做空
-                if vwap_position < -0.05 and momentum > 0:
-                    vwap_signal = min(abs(vwap_position) * 5, 1.0)
-                elif vwap_position > 0.05 and momentum < 0:
-                    vwap_signal = -min(abs(vwap_position) * 5, 1.0)
+        if not vwap_ok:
+            return "NEUTRAL", abs(imbalance), details
 
-                direction_score += vwap_signal * 0.2
-                details['vwap_signal'] = vwap_signal
+        # Step 6: 确定方向
+        # 均值回归模式: 反向入场
+        if self.config.entry_mode == "mean_reversion":
+            if imbalance > self.config.direction_signal_threshold:
+                # 强买压 -> 做空 (预期回调)
+                direction = "SHORT"
+                details['reason'] = f'均值回归做空: 买压{imbalance:.2f}'
+            elif imbalance < -self.config.direction_signal_threshold:
+                # 强卖压 -> 做多 (预期反弹)
+                direction = "LONG"
+                details['reason'] = f'均值回归做多: 卖压{imbalance:.2f}'
+            else:
+                return "NEUTRAL", abs(imbalance), details
+        else:
+            # 趋势跟随模式: 原逻辑
+            if imbalance > self.config.direction_signal_threshold:
+                direction = "LONG"
+                details['reason'] = f'趋势做多: 买压{imbalance:.2f}'
+            elif imbalance < -self.config.direction_signal_threshold:
+                direction = "SHORT"
+                details['reason'] = f'趋势做空: 卖压{imbalance:.2f}'
+            else:
+                return "NEUTRAL", abs(imbalance), details
 
-        # ========== 信号一致性检查 ==========
-        signals = [
-            imbalance if imbalance else 0,
-            self.quant_state.get_order_flow_imbalance() if self.config.order_flow_enabled else 0,
-            rsi_signal,
-            vwap_signal
-        ]
+        # Step 7: 计算最终信号强度
+        strength = abs(imbalance)
 
-        positive = sum(1 for s in signals if s > 0.1)
-        negative = sum(1 for s in signals if s < -0.1)
-        consistency = max(positive, negative) / len([s for s in signals if abs(s) > 0.05]) if any(abs(s) > 0.05 for s in signals) else 0
+        # spread越好，信号越强
+        spread_bonus = (40 - spread_percentile) / 100  # 0-0.4
+        strength = min(1.0, strength + spread_bonus)
 
-        details['consistency'] = consistency
-        details['direction_score'] = direction_score
+        # 检查最小信号强度
+        if strength < self.config.min_signal_strength:
+            return "NEUTRAL", strength, {'reason': f'最终强度不足 {strength:.2f} < {self.config.min_signal_strength}', **details}
 
-        # ========== 计算最终信号强度 ==========
-        raw_strength = abs(direction_score)
-
-        # 应用一致性权重
-        raw_strength *= (consistency * self.config.signal_consistency_weight + (1 - self.config.signal_consistency_weight))
-
-        # Spread异常检测 - 高spread时降低信号强度
-        spread_z = self.quant_state.get_spread_zscore()
-        if spread_z > 2:
-            raw_strength *= 0.5
-            details['spread_penalty'] = True
-
-        strength = min(raw_strength, 1.0)
         details['final_strength'] = strength
 
-        # ========== 确定方向 ==========
-        threshold = self.config.direction_signal_threshold
+        return direction, strength, details
 
-        if direction_score > threshold and strength >= self.config.min_signal_strength:
-            return "LONG", strength, details
-        elif direction_score < -threshold and strength >= self.config.min_signal_strength:
-            return "SHORT", strength, details
-        else:
-            return "NEUTRAL", strength, details
+    def _apply_additional_filters(self, direction: str, imbalance: float) -> tuple[bool, str]:
+        """
+        v3: 额外交易过滤条件
+
+        返回: (是否通过, 原因)
+        """
+        # 过滤1: 连续亏损后避免同向交易
+        if self.quant_state.consecutive_losses >= 2:
+            # 检查最近交易方向
+            if hasattr(self, 'last_trade_direction') and self.last_trade_direction:
+                if direction == self.last_trade_direction:
+                    return False, f"连续{self.quant_state.consecutive_losses}亏后避免同向{direction}"
+
+        # 过滤2: 时间间隔检查
+        if hasattr(self, 'last_trade_time') and self.last_trade_time:
+            time_since_last = time.time() - self.last_trade_time
+            if time_since_last < 5:  # 5秒内不重复交易
+                return False, f"交易间隔过短: {time_since_last:.1f}s"
+
+        # 过滤3: RSI极端值过滤
+        if self.config.rsi_enabled:
+            rsi = self.quant_state.get_rsi()
+            # 趋势跟随模式下，避免在RSI极端时逆向
+            if self.config.entry_mode == "trend":
+                if direction == "LONG" and rsi > 80:
+                    return False, f"RSI={rsi:.0f}超买，避免追多"
+                if direction == "SHORT" and rsi < 20:
+                    return False, f"RSI={rsi:.0f}超卖，避免追空"
+
+        return True, ""
+
+    def _calculate_smart_stop_loss(self, spread_pct: float, entry_price: float) -> float:
+        """
+        v3: 智能止损计算
+
+        考虑因素:
+        1. 当前spread (覆盖成本)
+        2. 近期ATR (真实波动)
+        3. 自适应调整
+        """
+        # 基础: 至少覆盖1.5个spread
+        spread_stop = spread_pct * 1.5
+
+        # ATR调整 (真实波动范围)
+        atr_pct = self.quant_state.get_atr_pct(period=20)
+        volatility_stop = atr_pct * 0.5  # 半个ATR
+
+        # 取较大值，避免被噪音止损
+        base_stop = max(spread_stop, volatility_stop)
+
+        # 自适应调整
+        if self.config.adaptive_stop_loss:
+            adaptive = self.quant_state.get_adaptive_stop_loss(
+                self.config.adaptive_stop_base,
+                self.config.adaptive_stop_volatility_mult
+            )
+            base_stop = max(base_stop, adaptive)
+
+        # 最终限制在合理范围
+        # 最低: 配置的基础值或2%
+        min_stop = max(self.config.adaptive_stop_base, 0.02)
+        # 最高: 8% (单笔亏损上限)
+        max_stop = 0.08
+
+        final_stop = max(min_stop, min(base_stop, max_stop))
+
+        log.info(f"[智能止损] spread={spread_stop:.3f}%, ATR={volatility_stop:.3f}%, 最终={final_stop:.3f}%")
+
+        return final_stop
 
     async def run_rpi_cycle(self) -> tuple[bool, str]:
         """
-        执行一个 RPI 交易周期 (研究优化版):
+        执行一个 RPI 交易周期 (v3 优化版):
         1. 时段过滤 - 避开低流动性时段
         2. 回撤控制 - 超限暂停交易
         3. 方向信号 - 订单簿不平衡度预测
@@ -1575,13 +1720,17 @@ class RPIBot:
             ofi_info = f"OFI={signal_details.get('order_flow', 0):.2f}" if self.config.order_flow_enabled else ""
 
             log.info(f"[量化信号] imb={imbalance:.2f} | {rsi_info} | {vwap_info} | {ofi_info}")
-            log.info(f"[方向判断] {direction} | 强度: {confidence:.2f} | 一致性: {signal_details.get('consistency', 0):.2f}")
+            log.info(f"[方向判断] {direction} | 强度: {confidence:.2f} | 原因: {signal_details.get('reason', 'N/A')}")
 
             # 使用方向信号阈值
             if direction == "NEUTRAL":
-                return False, f"无明确方向信号 (强度 {confidence:.2f} < {self.config.min_signal_strength})"
+                reason = signal_details.get('reason', f'强度 {confidence:.2f} < {self.config.min_signal_strength}')
+                return False, f"无明确方向信号: {reason}"
 
-            # 支持双向交易 (LONG做多 / SHORT做空)
+            # v3: 额外交易过滤
+            filter_ok, filter_reason = self._apply_additional_filters(direction, imbalance)
+            if not filter_ok:
+                return False, f"[过滤器] {filter_reason}"
 
         # 6. [简化] 入场模式判断 (支持双向)
         entry_signal = False
@@ -1679,22 +1828,8 @@ class RPIBot:
         if balance < required:
             return False, f"余额不足: {balance:.2f} < {required:.2f} USD"
 
-        # 9. [优化] 计算止盈止损 (使用风险收益比，并补偿spread)
-        # v2.2: 优先使用自适应止损（基于波动率）
-        if self.config.adaptive_stop_loss:
-            # 自适应止损 = 基础值 + 波动率 * 乘数
-            stop_loss_pct = self.quant_state.get_adaptive_stop_loss(
-                self.config.adaptive_stop_base,
-                self.config.adaptive_stop_volatility_mult
-            )
-            log.info(f"[自适应止损] {stop_loss_pct:.3f}% (基础{self.config.adaptive_stop_base:.2f}% + 波动率调整)")
-        elif self.config.dynamic_stop_loss:
-            # 动态止损 = spread * 倍数
-            dynamic_stop_pct = spread_pct * self.config.stop_loss_spread_multiplier
-            stop_loss_pct = max(0.01, min(dynamic_stop_pct, 0.05))
-            log.info(f"[动态止损] {stop_loss_pct:.3f}% (spread {spread_pct:.4f}% x {self.config.stop_loss_spread_multiplier})")
-        else:
-            stop_loss_pct = self.config.stop_loss_pct
+        # 9. [v3 优化] 计算止盈止损 (使用智能止损)
+        stop_loss_pct = self._calculate_smart_stop_loss(spread_pct, entry_price if 'entry_price' in dir() else mid_price)
 
         # 使用风险收益比计算止盈
         # 重要: 需要补偿spread
@@ -1726,6 +1861,10 @@ class RPIBot:
             return False, f"开仓失败 ({trade_direction})"
 
         self._record_trade()
+
+        # v3: 记录交易方向和时间（用于额外过滤）
+        self.last_trade_direction = trade_direction
+        self.last_trade_time = time.time()
 
         # 检查 RPI
         open_flags = open_result.get("flags", [])
